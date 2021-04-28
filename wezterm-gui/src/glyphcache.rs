@@ -11,6 +11,8 @@ use ::window::glium::texture::SrgbTexture2d;
 use ::window::{Point, Rect};
 use config::{AllowSquareGlyphOverflow, TextStyle};
 use euclid::num::Zero;
+
+use itertools::Itertools;
 use lru::LruCache;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -417,7 +419,7 @@ impl<T: Texture2d> GlyphCache<T> {
                     .is_some()
                 {
                     // Ensure that we propagate this signal to expand
-                    // our available teexture space
+                    // our available texture space
                     return Err(err);
                 }
 
@@ -470,7 +472,7 @@ impl<T: Texture2d> GlyphCache<T> {
 
         if info.font_idx == 0 {
             // The base font is the current font, so there's no additional metrics
-            // based scaling, however, we may need to scale to accomodate num_cells
+            // based scaling, however, we may need to scale to accommodate num_cells
             x_scale = 1.0 / info.num_cells as f64;
             y_scale = 1.0;
         } else if let (Some(base_cap), Some(cap)) =
@@ -806,25 +808,36 @@ impl<T: Texture2d> GlyphCache<T> {
             self.metrics.cell_size.width as usize,
             self.metrics.cell_size.height as usize,
         );
-        let black = SrgbaPixel::rgba(0, 0, 0, 0);
+        let transparent = SrgbaPixel::rgba(0, 0, 0, 0);
         let white = SrgbaPixel::rgba(0xff, 0xff, 0xff, 0xff);
+        let color_from_f = |f: f64| {
+            let val = (255. * f.min(1.0).max(0.0)).round() as u8;
+            SrgbaPixel::rgba(val, val, val, val)
+        };
 
         let cell_rect = Rect::new(Point::new(0, 0), self.metrics.cell_size);
 
+        let draw_line = |buffer: &mut Image, start: isize, row: isize, radius: f64, offset: f64| {
+            buffer.draw_line(
+                Point::new(0, row + start),
+                Point::new(self.metrics.cell_size.width, row + start),
+                color_from_f(if row == 0 {
+                    1.0 //r.min(1.0 - d) + r.min(d)
+                } else if row > 0 {
+                    radius + offset - row as f64
+                } else {
+                    radius - offset + 1. + row as f64
+                }),
+            );
+        };
+
         let draw_single = |buffer: &mut Image| {
-            for row in 0..self.metrics.underline_height {
-                buffer.draw_line(
-                    Point::new(
-                        cell_rect.origin.x,
-                        cell_rect.origin.y + self.metrics.descender_row + row,
-                    ),
-                    Point::new(
-                        cell_rect.origin.x + self.metrics.cell_size.width,
-                        cell_rect.origin.y + self.metrics.descender_row + row,
-                    ),
-                    white,
-                );
+            let d = self.metrics.descender_row_f.get() - self.metrics.descender_row as f64;
+            let r = self.metrics.underline_height_f.get() / 2.;
+            for row in -r.ceil() as isize..r.ceil() as isize + 1 {
+                draw_line(buffer, self.metrics.descender_row, row, r, d)
             }
+            let x = 20;
         };
 
         let draw_dotted = |buffer: &mut Image| {
@@ -843,7 +856,7 @@ impl<T: Texture2d> GlyphCache<T> {
                     *c = color.as_srgba32();
                     count -= 1;
                     if count == 0 {
-                        color = if color == white { black } else { white };
+                        color = if color == white { transparent } else { white };
                         count = segment_length;
                     }
                 }
@@ -865,7 +878,7 @@ impl<T: Texture2d> GlyphCache<T> {
                     *c = color.as_srgba32();
                     count -= 1;
                     if count == 0 {
-                        color = if color == white { black } else { white };
+                        color = if color == white { transparent } else { white };
                         count = third;
                     }
                 }
@@ -889,49 +902,63 @@ impl<T: Texture2d> GlyphCache<T> {
                 let pixel = buffer.pixel_mut(x, y);
                 let (current, _, _, _) = SrgbaPixel::with_srgba_u32(*pixel).as_rgba();
                 let value = current.saturating_add(val);
-                *pixel = SrgbaPixel::rgba(0xFF, 0xFF, 0xFF, val).as_srgba32();
+                *pixel = SrgbaPixel::rgba(0xFF, 0xFF, 0xFF, value).as_srgba32();
             }
 
-            for x in 0..self.metrics.cell_size.width as usize {
-                let vertical = wave_height as f32 / -3. * (x as f32 * x_factor).sin()
+            for x in -1..self.metrics.cell_size.width + 1 {
+                let vertical = wave_height as f32 / -2. * (x as f32 * x_factor).sin()
                     + wave_height as f32 / 2.;
-                let v = vertical.round();
+                let v = vertical.round() as isize;
 
-                for row in 0..self.metrics.underline_height as usize {
-                    let value = (255. * (vertical - v).abs()) as u8;
-                    add(x, row + y + v as usize, 0x88, max_y, buffer);
+                for (xi, yi) in ((x - 1).max(0)..(x + 1).min(self.metrics.cell_size.width))
+                    .cartesian_product(
+                        (v - 1).max(0)..(v + 1).min(self.metrics.cell_size.height - y as isize),
+                    )
+                {
+                    // println!(
+                    //     "{},{} - {}..{}, {}..{}",
+                    //     xi,
+                    //     yi,
+                    //     x,
+                    //     self.metrics.cell_size.width,
+                    //     v,
+                    //     self.metrics.cell_size.height - self.metrics.descender_row
+                    // );
+                    let d = ((x as f32 - xi as f32).powi(2) as f32
+                        + (vertical - yi as f32).powi(2))
+                    .sqrt();
+                    add(
+                        xi as usize,
+                        yi as usize + y,
+                        (100. * d) as u8,
+                        max_y,
+                        buffer,
+                    );
                 }
             }
-            println!("{:?}", *buffer);
-            buffer.log_bits();
         };
 
         let draw_double = |buffer: &mut Image| {
+            let second_line = self
+                .metrics
+                .descender_plus_two
+                .max(self.metrics.descender_row + 2 * self.metrics.underline_height)
+                .min(
+                    self.metrics.cell_size.height
+                        - (self.metrics.underline_height_f.get() / 2.).ceil() as isize,
+                );
             let first_line = self
                 .metrics
                 .descender_row
-                .min(self.metrics.descender_plus_two - 2 * self.metrics.underline_height);
+                .min(second_line - 2 * self.metrics.underline_height);
 
-            for row in 0..self.metrics.underline_height {
-                buffer.draw_line(
-                    Point::new(cell_rect.origin.x, cell_rect.origin.y + first_line + row),
-                    Point::new(
-                        cell_rect.origin.x + self.metrics.cell_size.width,
-                        cell_rect.origin.y + first_line + row,
-                    ),
-                    white,
-                );
-                buffer.draw_line(
-                    Point::new(
-                        cell_rect.origin.x,
-                        cell_rect.origin.y + self.metrics.descender_plus_two + row,
-                    ),
-                    Point::new(
-                        cell_rect.origin.x + self.metrics.cell_size.width,
-                        cell_rect.origin.y + self.metrics.descender_plus_two + row,
-                    ),
-                    white,
-                );
+            let d = self.metrics.descender_row_f.get() - self.metrics.descender_row as f64;
+            let d2 =
+                self.metrics.descender_plus_two_f.get() - self.metrics.descender_plus_two as f64;
+            let r = self.metrics.underline_height_f.get() / 2.;
+            for row in -r.ceil() as isize..r.ceil() as isize + 1 {
+                draw_line(buffer, first_line, row, r, d);
+                draw_line(buffer, second_line, row, r, d2);
             }
         };
 
@@ -964,7 +991,7 @@ impl<T: Texture2d> GlyphCache<T> {
             }
         };
 
-        buffer.clear_rect(cell_rect, black);
+        buffer.clear_rect(cell_rect, transparent);
         if key.overline {
             draw_overline(&mut buffer);
         }
