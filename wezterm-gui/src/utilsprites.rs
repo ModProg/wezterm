@@ -13,11 +13,7 @@ use wezterm_font::FontConfiguration;
 pub struct RenderMetrics {
     pub descender: PixelLength,
     pub descender_row: IntPixelLength,
-    pub descender_row_f: PixelLength,
-    pub descender_plus_two: IntPixelLength,
-    pub descender_plus_two_f: PixelLength,
     pub underline_height: IntPixelLength,
-    pub underline_height_f: PixelLength,
     pub strike_row: IntPixelLength,
     pub cell_size: Size,
 }
@@ -41,29 +37,20 @@ impl RenderMetrics {
             PixelLength::new(cell_height as f64 - metrics.cell_height.get().ceil()) / 2.;
 
         let underline_height = metrics.underline_thickness.get().round().max(1.0) as isize;
-        let underline_height_f = metrics.underline_thickness;
-        println!("{:?}", metrics);
 
         let descender_row_f = PixelLength::new(cell_height as f64)
             + (metrics.descender - metrics.underline_position)
             - line_height_y_adjust;
         let descender_row = descender_row_f.get() as isize;
-        let descender_plus_two_f = (underline_height_f + underline_height_f + descender_row_f)
-            .min(PixelLength::new(cell_height as f64) - underline_height_f);
-        let descender_plus_two = descender_plus_two_f.get() as isize;
 
         let strike_row = descender_row / 2;
 
         Ok(Self {
             descender: metrics.descender - line_height_y_adjust,
             descender_row,
-            descender_row_f,
-            descender_plus_two,
-            descender_plus_two_f,
             strike_row,
             cell_size: Size::new(cell_width as isize, cell_height as isize),
             underline_height,
-            underline_height_f,
         })
     }
 }

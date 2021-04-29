@@ -816,6 +816,7 @@ impl<T: Texture2d> GlyphCache<T> {
         };
 
         let cell_rect = Rect::new(Point::new(0, 0), self.metrics.cell_size);
+        let r = self.metrics.underline_height as f32 / 2.;
 
         let draw_line = |buffer: &mut Image, start: isize, row: isize, radius: f64, offset: f64| {
             buffer.draw_line(
@@ -832,32 +833,47 @@ impl<T: Texture2d> GlyphCache<T> {
         };
 
         let draw_single = |buffer: &mut Image| {
-            let d = self.metrics.descender_row_f.get() - self.metrics.descender_row as f64;
-            let r = self.metrics.underline_height_f.get() / 2.;
-            for row in -r.ceil() as isize..r.ceil() as isize + 1 {
-                draw_line(buffer, self.metrics.descender_row, row, r, d)
+            for row in 1 - r.ceil() as isize..r.floor() as isize + 1 {
+                buffer.draw_line(
+                    Point::new(0, row + self.metrics.descender_row),
+                    Point::new(
+                        self.metrics.cell_size.width,
+                        row + self.metrics.descender_row,
+                    ),
+                    white,
+                );
             }
-            let x = 20;
         };
 
         let draw_dotted = |buffer: &mut Image| {
-            for row in 0..self.metrics.underline_height {
+            for row in 1 - r.ceil() as isize..r.floor() as isize + 1 {
                 let y = (cell_rect.origin.y + self.metrics.descender_row + row) as usize;
                 if y >= self.metrics.cell_size.height as usize {
                     break;
                 }
 
                 let mut color = white;
-                let segment_length = (self.metrics.cell_size.width / 4) as usize;
+                let wanted_n = self.metrics.cell_size.width as f32
+                    / self.metrics.underline_height as f32
+                    / 2.;
+                let segment_length = //self.metrics.cell_size.width / wanted_n;
+                (self.metrics.cell_size.width as f32 / wanted_n);
                 let mut count = segment_length;
                 let range =
                     buffer.horizontal_pixel_range_mut(0, self.metrics.cell_size.width as usize, y);
-                for c in range.iter_mut() {
+                for (c, i) in range.iter_mut().zip(0..self.metrics.cell_size.width) {
+                    let draw = i;
+
                     *c = color.as_srgba32();
                     count -= 1;
                     if count == 0 {
-                        color = if color == white { transparent } else { white };
-                        count = segment_length;
+                        color = if color == white {
+                            count = segment_length;
+                            transparent
+                        } else {
+                            count = segment_length;
+                            white
+                        };
                     }
                 }
             }
@@ -939,26 +955,25 @@ impl<T: Texture2d> GlyphCache<T> {
         };
 
         let draw_double = |buffer: &mut Image| {
-            let second_line = self
-                .metrics
-                .descender_plus_two
-                .max(self.metrics.descender_row + 2 * self.metrics.underline_height)
-                .min(
-                    self.metrics.cell_size.height
-                        - (self.metrics.underline_height_f.get() / 2.).ceil() as isize,
-                );
+            let second_line = (self.metrics.descender_row + 2 * self.metrics.underline_height)
+                .min(self.metrics.cell_size.height - r.floor() as isize);
+
             let first_line = self
                 .metrics
                 .descender_row
                 .min(second_line - 2 * self.metrics.underline_height);
 
-            let d = self.metrics.descender_row_f.get() - self.metrics.descender_row as f64;
-            let d2 =
-                self.metrics.descender_plus_two_f.get() - self.metrics.descender_plus_two as f64;
-            let r = self.metrics.underline_height_f.get() / 2.;
-            for row in -r.ceil() as isize..r.ceil() as isize + 1 {
-                draw_line(buffer, first_line, row, r, d);
-                draw_line(buffer, second_line, row, r, d2);
+            for row in 1 - r.ceil() as isize..r.floor() as isize + 1 {
+                buffer.draw_line(
+                    Point::new(0, row + first_line),
+                    Point::new(self.metrics.cell_size.width, row + first_line),
+                    white,
+                );
+                buffer.draw_line(
+                    Point::new(0, row + second_line),
+                    Point::new(self.metrics.cell_size.width, row + second_line),
+                    white,
+                );
             }
         };
 
