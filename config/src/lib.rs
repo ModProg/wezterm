@@ -142,6 +142,7 @@ pub fn designate_this_as_the_main_thread() {
     });
 }
 
+#[must_use = "Cancels the subscription when dropped"]
 pub struct ConfigSubscription(usize);
 
 impl Drop for ConfigSubscription {
@@ -150,11 +151,11 @@ impl Drop for ConfigSubscription {
     }
 }
 
-pub fn subscribe_to_config_reload<F>(subscriber: F)
+pub fn subscribe_to_config_reload<F>(subscriber: F) -> ConfigSubscription
 where
     F: Fn() -> bool + 'static + Send,
 {
-    CONFIG.subscribe(subscriber);
+    ConfigSubscription(CONFIG.subscribe(subscriber))
 }
 
 /// Spawn a future that will run with an optional Lua state from the most
@@ -561,12 +562,12 @@ impl Configuration {
     }
 
     /// Subscribe to config reload events
-    fn subscribe<F>(&self, subscriber: F)
+    fn subscribe<F>(&self, subscriber: F) -> usize
     where
         F: Fn() -> bool + 'static + Send,
     {
         let mut inner = self.inner.lock().unwrap();
-        inner.subscribe(subscriber);
+        inner.subscribe(subscriber)
     }
 
     fn unsub(&self, sub_id: usize) {
@@ -738,6 +739,9 @@ pub struct Config {
     pub colors: Option<Palette>,
 
     #[serde(default)]
+    pub window_frame: WindowFrameConfig,
+
+    #[serde(default)]
     pub tab_bar_style: TabBarStyle,
 
     #[serde(skip)]
@@ -883,6 +887,12 @@ pub struct Config {
 
     #[serde(default)]
     pub keys: Vec<Key>,
+    #[serde(
+        default = "default_bypass_mouse_reporting_modifiers",
+        deserialize_with = "crate::keys::de_modifiers"
+    )]
+    pub bypass_mouse_reporting_modifiers: Modifiers,
+
     #[serde(default)]
     pub debug_key_events: bool,
 
@@ -1777,4 +1787,8 @@ fn default_read_timeout() -> Duration {
 
 fn default_write_timeout() -> Duration {
     Duration::from_secs(60)
+}
+
+fn default_bypass_mouse_reporting_modifiers() -> Modifiers {
+    Modifiers::SHIFT
 }

@@ -9,6 +9,7 @@ use portable_pty::PtySize;
 use regex::Regex;
 use serde::*;
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -118,7 +119,7 @@ fn classify_asset_name(name: &str) -> AssetKind {
 }
 
 fn get_github_release_info(uri: &str) -> anyhow::Result<Release> {
-    let uri = uri.parse::<Uri>().expect("URL to be valid!?");
+    let uri = Uri::try_from(uri)?;
 
     let mut latest = Vec::new();
     let _res = Request::new(&uri)

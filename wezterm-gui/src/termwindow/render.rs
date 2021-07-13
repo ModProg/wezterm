@@ -17,8 +17,10 @@ use config::{ConfigHandle, HsbTransform, TextStyle};
 use mux::pane::Pane;
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::{PositionedPane, PositionedSplit, SplitDirection};
+use smol::Timer;
 use std::ops::Range;
 use std::rc::Rc;
+use std::time::Duration;
 use std::time::Instant;
 use termwiz::cellcluster::CellCluster;
 use termwiz::surface::{CursorShape, CursorVisibility};
@@ -41,6 +43,8 @@ pub struct RenderScreenLineOpenGLParams<'a> {
     pub config: &'a ConfigHandle,
     pub pos: &'a PositionedPane,
 
+    pub white_space: TextureRect,
+
     pub cursor_border_color: LinearRgba,
     pub foreground: LinearRgba,
     pub is_active: bool,
@@ -49,6 +53,9 @@ pub struct RenderScreenLineOpenGLParams<'a> {
     pub selection_bg: LinearRgba,
     pub cursor_fg: LinearRgba,
     pub cursor_bg: LinearRgba,
+
+    pub window_is_transparent: bool,
+    pub default_bg: LinearRgba,
 }
 
 pub struct ComputeCellFgBgParams<'a> {
@@ -131,7 +138,25 @@ impl super::TermWindow {
         self.call_draw(frame).ok();
         log::debug!("paint_impl elapsed={:?}", start.elapsed());
         metrics::histogram!("gui.paint.opengl", start.elapsed());
+        metrics::histogram!("gui.paint.opengl.rate", 1.);
         self.update_title_post_status();
+
+        // If self.has_animation is some, then the last render detected
+        // image attachments with multiple frames, so we also need to
+        // invalidate the viewport when the next frame is due
+        if self.focused.is_some() {
+            if let Some(next_due) = *self.has_animation.borrow() {
+                if Some(next_due) != *self.scheduled_animation.borrow() {
+                    self.scheduled_animation.borrow_mut().replace(next_due);
+                    let window = self.window.clone().take().unwrap();
+                    promise::spawn::spawn(async move {
+                        Timer::at(next_due).await;
+                        window.invalidate();
+                    })
+                    .detach();
+                }
+            }
+        }
     }
 
     fn update_next_frame_time(&self, next_due: Option<Instant>) {
@@ -190,14 +215,29 @@ impl super::TermWindow {
         let start = Instant::now();
         let mut quads = gl_state.quads.map(&mut vb);
         log::trace!("quad map elapsed {:?}", start.elapsed());
+        metrics::histogram!("quad.map", start.elapsed());
 
-        let cursor_border_color =
-            rgbcolor_to_window_color(if self.config.force_reverse_video_cursor {
-                palette.foreground
-            } else {
-                palette.cursor_border
-            });
+        let cursor_border_color = rgbcolor_to_window_color(palette.cursor_border);
         let foreground = rgbcolor_to_window_color(palette.foreground);
+        let white_space = gl_state.util_sprites.white_space.texture_coords();
+
+        let window_is_transparent =
+            self.window_background.is_some() || config.window_background_opacity != 1.0;
+
+        // Pre-set the row with the whitespace glyph.
+        // This is here primarily because clustering/shaping can cause the line updates
+        // to skip setting a quad that is logically obscured by a double-wide glyph.
+        // If eg: scrolling the viewport causes the pair of quads to change from two
+        // individual cells to a single double-wide cell then we might leave the second
+        // one of the pair with the glyph from the prior viewport position.
+        let default_bg = rgbcolor_alpha_to_window_color(
+            palette.resolve_bg(ColorAttribute::Default),
+            if window_is_transparent {
+                0x00
+            } else {
+                (config.text_background_opacity * 255.0) as u8
+            },
+        );
 
         if self.show_tab_bar && pos.index == 0 {
             let tab_dims = RenderableDimensions {
@@ -234,6 +274,9 @@ impl super::TermWindow {
                     selection_bg: LinearRgba::default(),
                     cursor_fg: LinearRgba::default(),
                     cursor_bg: LinearRgba::default(),
+                    white_space,
+                    window_is_transparent,
+                    default_bg,
                 },
                 &mut quads,
             )?;
@@ -273,8 +316,6 @@ impl super::TermWindow {
             let right = self.dimensions.pixel_width as f32 / 2.;
             let left = right - padding;
 
-            let white_space = gl_state.util_sprites.white_space.texture_coords();
-
             quad.set_bg_color(color);
             quad.set_fg_color(color);
             quad.set_underline_color(color);
@@ -290,7 +331,6 @@ impl super::TermWindow {
 
         {
             let mut quad = quads.background_image();
-            let white_space = gl_state.util_sprites.white_space.texture_coords();
             quad.set_underline(white_space);
             quad.set_cursor(white_space);
 
@@ -320,16 +360,8 @@ impl super::TermWindow {
         let start = Instant::now();
         let selection_fg = rgbcolor_to_window_color(palette.selection_fg);
         let selection_bg = rgbcolor_to_window_color(palette.selection_bg);
-        let cursor_fg = rgbcolor_to_window_color(if self.config.force_reverse_video_cursor {
-            palette.background
-        } else {
-            palette.cursor_fg
-        });
-        let cursor_bg = rgbcolor_to_window_color(if self.config.force_reverse_video_cursor {
-            palette.foreground
-        } else {
-            palette.cursor_bg
-        });
+        let cursor_fg = rgbcolor_to_window_color(palette.cursor_fg);
+        let cursor_bg = rgbcolor_to_window_color(palette.cursor_bg);
         for (line_idx, line) in lines.iter().enumerate() {
             let stable_row = stable_top + line_idx as StableRowIndex;
 
@@ -353,14 +385,19 @@ impl super::TermWindow {
                     selection_bg,
                     cursor_fg,
                     cursor_bg,
+                    white_space,
+                    window_is_transparent,
+                    default_bg,
                 },
                 &mut quads,
             )?;
         }
+        metrics::histogram!("paint_pane_opengl.lines", start.elapsed());
         log::trace!("lines elapsed {:?}", start.elapsed());
 
         let start = Instant::now();
         drop(quads);
+        metrics::histogram!("paint_pane_opengl.drop.quads", start.elapsed());
         log::trace!("quad drop elapsed {:?}", start.elapsed());
 
         Ok(())
@@ -515,11 +552,12 @@ impl super::TermWindow {
         let mut vb = gl_state.glyph_vertex_buffer.borrow_mut();
         let mut quads = gl_state.quads.map(&mut vb);
         let config = &self.config;
-        let text = if split.direction == SplitDirection::Horizontal {
-            "│"
+        let block = BlockKey::from_char(if split.direction == SplitDirection::Horizontal {
+            '\u{2502}'
         } else {
-            "─"
-        };
+            '\u{2500}'
+        })
+        .expect("to have box drawing glyph");
         let palette = pane.palette();
         let foreground = rgbcolor_to_window_color(palette.split);
         let background = rgbcolor_alpha_to_window_color(
@@ -531,114 +569,41 @@ impl super::TermWindow {
             },
         );
 
-        let style = self.fonts.match_style(&config, &CellAttributes::default());
-        let glyph_info = {
-            let key = BorrowedShapeCacheKey { style, text };
-            match self.lookup_cached_shape(&key) {
-                Some(Ok(info)) => info,
-                Some(Err(err)) => return Err(err),
-                None => {
-                    let font = self.fonts.resolve_font(style)?;
-                    let window = self.window.as_ref().unwrap().clone();
-                    match font.shape(
-                        text,
-                        move || window.notify(TermWindowNotif::InvalidateShapeCache),
-                        BlockKey::filter_out_synthetic,
-                    ) {
-                        Ok(info) => {
-                            let line = Line::from_text(&text, &CellAttributes::default());
-                            let clusters = line.cluster();
-                            let glyphs = self.glyph_infos_to_glyphs(
-                                &clusters[0],
-                                &line,
-                                &style,
-                                &mut gl_state.glyph_cache.borrow_mut(),
-                                &info,
-                            )?;
-                            let shaped = ShapedInfo::process(
-                                &self.render_metrics,
-                                &clusters[0],
-                                &info,
-                                &glyphs,
-                            );
-                            self.shape_cache
-                                .borrow_mut()
-                                .put(key.to_owned(), Ok(Rc::new(shaped)));
-                            self.lookup_cached_shape(&key).unwrap().unwrap()
-                        }
-                        Err(err) => {
-                            if err.root_cause().downcast_ref::<ClearShapeCache>().is_some() {
-                                return Err(err);
-                            }
-
-                            let res = anyhow!("shaper error: {}", err);
-                            self.shape_cache.borrow_mut().put(key.to_owned(), Err(err));
-                            return Err(res);
-                        }
-                    }
-                }
-            }
-        };
         let first_row_offset = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
             1
         } else {
             0
         };
+        let white_space = gl_state.util_sprites.white_space.texture_coords();
 
-        for info in glyph_info.iter() {
-            let glyph = &info.glyph;
-            let left = info.pos.x_offset.get() as f32 + info.pos.bearing_x;
-            let top = ((PixelLength::new(self.render_metrics.cell_size.height as f64)
-                + self.render_metrics.descender)
-                - (glyph.y_offset + glyph.bearing_y))
-                .get() as f32;
-
-            let texture = glyph
-                .texture
-                .as_ref()
-                .unwrap_or(&gl_state.util_sprites.white_space);
-            let underline_tex_rect = gl_state.util_sprites.white_space.texture_coords();
-
-            let x_y_iter: Box<dyn Iterator<Item = (usize, usize)>> = if split.direction
-                == SplitDirection::Horizontal
-            {
+        let x_y_iter: Box<dyn Iterator<Item = (usize, usize)>> =
+            if split.direction == SplitDirection::Horizontal {
                 Box::new(std::iter::repeat(split.left).zip(split.top..split.top + split.size))
             } else {
                 Box::new((split.left..split.left + split.size).zip(std::iter::repeat(split.top)))
             };
-            for (x, y) in x_y_iter {
-                let slice = SpriteSlice {
-                    cell_idx: 0,
-                    num_cells: info.pos.num_cells as usize,
-                    cell_width: self.render_metrics.cell_size.width as usize,
-                    scale: glyph.scale as f32,
-                    left_offset: left,
-                };
+        for (x, y) in x_y_iter {
+            let sprite = gl_state
+                .glyph_cache
+                .borrow_mut()
+                .cached_block(block)?
+                .texture_coords();
 
-                let pixel_rect = slice.pixel_rect(texture);
-                let texture_rect = texture.texture.to_texture_coords(pixel_rect);
+            let mut quad = match quads.cell(x, y + first_row_offset) {
+                Ok(quad) => quad,
+                Err(_) => break,
+            };
 
-                let bottom = (pixel_rect.size.height as f32 * glyph.scale as f32) + top
-                    - self.render_metrics.cell_size.height as f32;
-                let right = pixel_rect.size.width as f32 + left
-                    - self.render_metrics.cell_size.width as f32;
-
-                let mut quad = match quads.cell(x, y + first_row_offset) {
-                    Ok(quad) => quad,
-                    Err(_) => break,
-                };
-
-                quad.set_fg_color(foreground);
-                quad.set_underline_color(foreground);
-                quad.set_bg_color(background);
-                quad.set_hsv(None);
-                quad.set_texture(texture_rect);
-                quad.set_texture_adjust(left, top, right, bottom);
-                quad.set_underline(underline_tex_rect);
-                quad.set_has_color(glyph.has_color);
-                quad.set_cursor(underline_tex_rect);
-                quad.set_cursor_color(background);
-            }
+            quad.set_fg_color(foreground);
+            quad.set_underline_color(foreground);
+            quad.set_bg_color(background);
+            quad.set_hsv(None);
+            quad.set_texture(sprite);
+            quad.set_texture_adjust(0., 0., 0., 0.);
+            quad.set_underline(white_space);
+            quad.set_has_color(false);
+            quad.set_cursor(white_space);
+            quad.set_cursor_color(background);
         }
         Ok(())
     }
@@ -682,26 +647,6 @@ impl super::TermWindow {
             Some(params.config.inactive_pane_hsb)
         };
 
-        let window_is_transparent =
-            self.window_background.is_some() || params.config.window_background_opacity != 1.0;
-
-        let white_space = gl_state.util_sprites.white_space.texture_coords();
-
-        // Pre-set the row with the whitespace glyph.
-        // This is here primarily because clustering/shaping can cause the line updates
-        // to skip setting a quad that is logically obscured by a double-wide glyph.
-        // If eg: scrolling the viewport causes the pair of quads to change from two
-        // individual cells to a single double-wide cell then we might leave the second
-        // one of the pair with the glyph from the prior viewport position.
-        let default_bg = rgbcolor_alpha_to_window_color(
-            params.palette.resolve_bg(ColorAttribute::Default),
-            if window_is_transparent {
-                0x00
-            } else {
-                (params.config.text_background_opacity * 255.0) as u8
-            },
-        );
-
         // Clear the cells to basic blanks to avoid leaving artifacts behind.
         // The easiest reproduction for the artifacts is to maximize the window and
         // open a vim split horizontally.  Backgrounding vim would leave
@@ -714,11 +659,11 @@ impl super::TermWindow {
                     Err(_) => break,
                 };
 
-            quad.set_bg_color(default_bg);
-            quad.set_texture(white_space);
+            quad.set_bg_color(params.default_bg);
+            quad.set_texture(params.white_space);
             quad.set_texture_adjust(0., 0., 0., 0.);
-            quad.set_underline(white_space);
-            quad.set_cursor(white_space);
+            quad.set_underline(params.white_space);
+            quad.set_cursor(params.white_space);
             quad.set_has_color(false);
             quad.set_hsv(hsv);
         }
@@ -726,6 +671,7 @@ impl super::TermWindow {
         // Break the line into clusters of cells with the same attributes
         let start = Instant::now();
         let cell_clusters = params.line.cluster();
+        metrics::histogram!("render_screen_line_opengl.line.cluster", start.elapsed());
         log::trace!(
             "cluster -> {} clusters, elapsed {:?}",
             cell_clusters.len(),
@@ -733,153 +679,91 @@ impl super::TermWindow {
         );
 
         let mut last_cell_idx = 0;
+        let mut current_idx = 0;
+
+        // Basic cache of computed data from prior cluster to avoid doing the same
+        // work for space separated clusters with the same style
+        struct ClusterStyleCache<'a> {
+            attrs: &'a CellAttributes,
+            style: &'a TextStyle,
+            underline_tex_rect: TextureRect,
+            fg_color: LinearRgba,
+            bg_color: LinearRgba,
+            underline_color: LinearRgba,
+        }
+        let mut last_style = None;
 
         for cluster in &cell_clusters {
-            let attrs = &cluster.attrs;
+            if !matches!(last_style.as_ref(), Some(ClusterStyleCache{attrs,..}) if *attrs == &cluster.attrs)
+            {
+                let attrs = &cluster.attrs;
+                let style = self.fonts.match_style(params.config, attrs);
+                let is_highlited_hyperlink = match (attrs.hyperlink(), &self.current_highlight) {
+                    (Some(ref this), &Some(ref highlight)) => **this == *highlight,
+                    _ => false,
+                };
+                // underline and strikethrough
+                let underline_tex_rect = gl_state
+                    .glyph_cache
+                    .borrow_mut()
+                    .cached_line_sprite(
+                        is_highlited_hyperlink,
+                        attrs.strikethrough(),
+                        attrs.underline(),
+                        attrs.overline(),
+                    )?
+                    .texture_coords();
+                let bg_is_default = attrs.background() == ColorAttribute::Default;
+                let bg_color = params.palette.resolve_bg(attrs.background());
 
-            let is_highlited_hyperlink = match (attrs.hyperlink(), &self.current_highlight) {
-                (Some(ref this), &Some(ref highlight)) => **this == *highlight,
-                _ => false,
-            };
-            let style = self.fonts.match_style(params.config, attrs);
-            // underline and strikethrough
-            let underline_tex_rect = gl_state
-                .glyph_cache
-                .borrow_mut()
-                .cached_line_sprite(
-                    is_highlited_hyperlink,
-                    attrs.strikethrough(),
-                    attrs.underline(),
-                    attrs.overline(),
-                )?
-                .texture_coords();
+                let fg_color = resolve_fg_color_attr(&attrs, attrs.foreground(), &params, style);
 
-            let bg_is_default = attrs.background == ColorAttribute::Default;
-            let bg_color = params.palette.resolve_bg(attrs.background);
+                let (fg_color, bg_color, bg_is_default) = {
+                    let mut fg = fg_color;
+                    let mut bg = bg_color;
+                    let mut bg_default = bg_is_default;
 
-            fn resolve_fg_color_attr(
-                attrs: &CellAttributes,
-                fg: &ColorAttribute,
-                params: &RenderScreenLineOpenGLParams,
-                style: &config::TextStyle,
-            ) -> RgbColor {
-                match fg {
-                    wezterm_term::color::ColorAttribute::Default => {
-                        if let Some(fg) = style.foreground {
-                            fg
-                        } else {
-                            params.palette.resolve_fg(attrs.foreground)
-                        }
+                    if attrs.reverse() {
+                        std::mem::swap(&mut fg, &mut bg);
+                        bg_default = false;
                     }
-                    wezterm_term::color::ColorAttribute::PaletteIndex(idx)
-                        if *idx < 8 && params.config.bold_brightens_ansi_colors =>
-                    {
-                        // For compatibility purposes, switch to a brighter version
-                        // of one of the standard ANSI colors when Bold is enabled.
-                        // This lifts black to dark grey.
-                        let idx = if attrs.intensity() == wezterm_term::Intensity::Bold {
-                            *idx + 8
-                        } else {
-                            *idx
-                        };
-                        params
-                            .palette
-                            .resolve_fg(wezterm_term::color::ColorAttribute::PaletteIndex(idx))
-                    }
-                    _ => params.palette.resolve_fg(*fg),
-                }
+
+                    (fg, bg, bg_default)
+                };
+
+                let glyph_color = rgbcolor_to_window_color(fg_color);
+                let underline_color = match attrs.underline_color() {
+                    ColorAttribute::Default => fg_color,
+                    c => resolve_fg_color_attr(&attrs, c, &params, style),
+                };
+                let underline_color = rgbcolor_to_window_color(underline_color);
+
+                let bg_color = rgbcolor_alpha_to_window_color(
+                    bg_color,
+                    if params.window_is_transparent && bg_is_default {
+                        0x00
+                    } else {
+                        (params.config.text_background_opacity * 255.0) as u8
+                    },
+                );
+
+                last_style.replace(ClusterStyleCache {
+                    attrs,
+                    style,
+                    underline_tex_rect: underline_tex_rect.clone(),
+                    bg_color,
+                    fg_color: glyph_color,
+                    underline_color,
+                });
             }
-            let fg_color = resolve_fg_color_attr(&attrs, &attrs.foreground, &params, &style);
 
-            let (fg_color, bg_color, bg_is_default) = {
-                let mut fg = fg_color;
-                let mut bg = bg_color;
-                let mut bg_default = bg_is_default;
-
-                if attrs.reverse() {
-                    std::mem::swap(&mut fg, &mut bg);
-                    bg_default = false;
-                }
-
-                (fg, bg, bg_default)
-            };
-
-            let glyph_color = rgbcolor_to_window_color(fg_color);
-            let underline_color = match attrs.underline_color() {
-                ColorAttribute::Default => fg_color,
-                c => resolve_fg_color_attr(&attrs, &c, &params, &style),
-            };
-            let underline_color = rgbcolor_to_window_color(underline_color);
-
-            let bg_color = rgbcolor_alpha_to_window_color(
-                bg_color,
-                if window_is_transparent && bg_is_default {
-                    0x00
-                } else {
-                    (params.config.text_background_opacity * 255.0) as u8
-                },
-            );
+            let style_params = last_style.as_ref().expect("we literally just assigned it");
 
             // Shape the printable text from this cluster
-
-            let shape_resolve_start = Instant::now();
-            let glyph_info = {
-                let key = BorrowedShapeCacheKey {
-                    style,
-                    text: &cluster.text,
-                };
-                match self.lookup_cached_shape(&key) {
-                    Some(Ok(info)) => info,
-                    Some(Err(err)) => return Err(err),
-                    None => {
-                        let font = self.fonts.resolve_font(style)?;
-                        let window = self.window.as_ref().unwrap().clone();
-                        match font.shape(
-                            &cluster.text,
-                            move || window.notify(TermWindowNotif::InvalidateShapeCache),
-                            BlockKey::filter_out_synthetic,
-                        ) {
-                            Ok(info) => {
-                                let glyphs = self.glyph_infos_to_glyphs(
-                                    cluster,
-                                    &params.line,
-                                    &style,
-                                    &mut gl_state.glyph_cache.borrow_mut(),
-                                    &info,
-                                )?;
-                                let shaped = ShapedInfo::process(
-                                    &self.render_metrics,
-                                    cluster,
-                                    &info,
-                                    &glyphs,
-                                );
-
-                                self.shape_cache
-                                    .borrow_mut()
-                                    .put(key.to_owned(), Ok(Rc::new(shaped)));
-                                self.lookup_cached_shape(&key).unwrap().unwrap()
-                            }
-                            Err(err) => {
-                                if err.root_cause().downcast_ref::<ClearShapeCache>().is_some() {
-                                    return Err(err);
-                                }
-
-                                let res = anyhow!("shaper error: {}", err);
-                                self.shape_cache.borrow_mut().put(key.to_owned(), Err(err));
-                                return Err(res);
-                            }
-                        }
-                    }
-                }
-            };
-            log::trace!(
-                "shape_resolve for cluster len {} -> elapsed {:?}",
-                cluster.text.len(),
-                shape_resolve_start.elapsed()
-            );
+            let glyph_info =
+                self.cached_cluster_shape(style_params.style, &cluster, &gl_state, params.line)?;
 
             for info in glyph_info.iter() {
-                let cell_idx = cluster.byte_to_cell_idx(info.pos.cluster as usize);
                 let glyph = &info.glyph;
 
                 let top = ((PixelLength::new(self.render_metrics.cell_size.height as f64)
@@ -894,7 +778,7 @@ impl super::TermWindow {
                 // a single cell per glyph but combining characters, ligatures
                 // and emoji can be 2 or more cells wide.
                 for glyph_idx in 0..info.pos.num_cells as usize {
-                    let cell_idx = cell_idx + glyph_idx;
+                    let cell_idx = current_idx + glyph_idx;
 
                     if cell_idx >= num_cols {
                         // terminal line data is wider than the window.
@@ -903,7 +787,7 @@ impl super::TermWindow {
                         break;
                     }
 
-                    last_cell_idx = cell_idx;
+                    last_cell_idx = current_idx;
 
                     let ComputeCellFgBgResult {
                         fg_color: glyph_color,
@@ -914,8 +798,8 @@ impl super::TermWindow {
                         cell_idx,
                         cursor: params.cursor,
                         selection: &params.selection,
-                        fg_color: glyph_color,
-                        bg_color,
+                        fg_color: style_params.fg_color,
+                        bg_color: style_params.bg_color,
                         palette: params.palette,
                         is_active_pane: params.pos.is_active,
                         config: params.config,
@@ -925,7 +809,7 @@ impl super::TermWindow {
                         cursor_bg: params.cursor_bg,
                     });
 
-                    if let Some(image) = attrs.image() {
+                    if let Some(image) = cluster.attrs.image() {
                         self.populate_image_quad(
                             image,
                             gl_state,
@@ -935,29 +819,29 @@ impl super::TermWindow {
                             hsv,
                             cursor_shape,
                             glyph_color,
-                            underline_color,
+                            style_params.underline_color,
                             bg_color,
-                            white_space,
                         )?;
                         continue;
                     }
 
                     if self.config.custom_block_glyphs && glyph_idx == 0 {
-                        if let Some(block) = BlockKey::from_cell(&params.line.cells()[cell_idx]) {
-                            self.populate_block_quad(
-                                block,
-                                gl_state,
-                                quads,
-                                cell_idx,
-                                &params,
-                                hsv,
-                                cursor_shape,
-                                glyph_color,
-                                underline_color,
-                                bg_color,
-                                white_space,
-                            )?;
-                            continue;
+                        if let Some(cell) = params.line.cells().get(cell_idx) {
+                            if let Some(block) = BlockKey::from_cell(cell) {
+                                self.populate_block_quad(
+                                    block,
+                                    gl_state,
+                                    quads,
+                                    cell_idx,
+                                    &params,
+                                    hsv,
+                                    cursor_shape,
+                                    glyph_color,
+                                    style_params.underline_color,
+                                    bg_color,
+                                )?;
+                                continue;
+                            }
                         }
                     }
 
@@ -1003,8 +887,8 @@ impl super::TermWindow {
                     quad.set_bg_color(bg_color);
                     quad.set_texture(texture_rect);
                     quad.set_texture_adjust(left, top, right, bottom);
-                    quad.set_underline(underline_tex_rect);
-                    quad.set_underline_color(underline_color);
+                    quad.set_underline(style_params.underline_tex_rect);
+                    quad.set_underline_color(style_params.underline_color);
                     quad.set_hsv(if glyph.brightness_adjust != 1.0 {
                         let hsv = hsv.unwrap_or_else(|| HsbTransform::default());
                         Some(HsbTransform {
@@ -1021,8 +905,13 @@ impl super::TermWindow {
                             .cursor_sprite(cursor_shape)
                             .texture_coords(),
                     );
-                    quad.set_cursor_color(params.cursor_border_color);
+                    quad.set_cursor_color(if self.config.force_reverse_video_cursor {
+                        bg_color
+                    } else {
+                        params.cursor_border_color
+                    });
                 }
+                current_idx += info.pos.num_cells as usize;
             }
         }
 
@@ -1063,7 +952,7 @@ impl super::TermWindow {
                     cursor: params.cursor,
                     selection: &params.selection,
                     fg_color: params.foreground,
-                    bg_color: default_bg,
+                    bg_color: params.default_bg,
                     palette: params.palette,
                     is_active_pane: params.pos.is_active,
                     config: params.config,
@@ -1085,10 +974,19 @@ impl super::TermWindow {
                             .cursor_sprite(cursor_shape)
                             .texture_coords(),
                     );
-                    quad.set_cursor_color(params.cursor_border_color);
+                    quad.set_cursor_color(if self.config.force_reverse_video_cursor {
+                        bg_color
+                    } else {
+                        params.cursor_border_color
+                    });
                 }
             }
         }
+        metrics::histogram!(
+            "render_screen_line_opengl.right_fill",
+            right_fill_start.elapsed()
+        );
+        metrics::histogram!("render_screen_line_opengl", start.elapsed());
         log::trace!(
             "right fill {} -> elapsed {:?}",
             num_cols.saturating_sub(last_cell_idx),
@@ -1110,7 +1008,6 @@ impl super::TermWindow {
         glyph_color: LinearRgba,
         underline_color: LinearRgba,
         bg_color: LinearRgba,
-        white_space: TextureRect,
     ) -> anyhow::Result<()> {
         let sprite = gl_state
             .glyph_cache
@@ -1130,7 +1027,7 @@ impl super::TermWindow {
         quad.set_bg_color(bg_color);
         quad.set_texture(sprite);
         quad.set_texture_adjust(0., 0., 0., 0.);
-        quad.set_underline(white_space);
+        quad.set_underline(params.white_space);
         quad.set_has_color(false);
         quad.set_cursor(
             gl_state
@@ -1138,7 +1035,11 @@ impl super::TermWindow {
                 .cursor_sprite(cursor_shape)
                 .texture_coords(),
         );
-        quad.set_cursor_color(params.cursor_border_color);
+        quad.set_cursor_color(if self.config.force_reverse_video_cursor {
+            bg_color
+        } else {
+            params.cursor_border_color
+        });
 
         Ok(())
     }
@@ -1156,7 +1057,6 @@ impl super::TermWindow {
         glyph_color: LinearRgba,
         underline_color: LinearRgba,
         bg_color: LinearRgba,
-        white_space: TextureRect,
     ) -> anyhow::Result<()> {
         let padding = self
             .render_metrics
@@ -1211,7 +1111,7 @@ impl super::TermWindow {
         quad.set_bg_color(bg_color);
         quad.set_texture(texture_rect);
         quad.set_texture_adjust(0., 0., 0., 0.);
-        quad.set_underline(white_space);
+        quad.set_underline(params.white_space);
         quad.set_has_color(true);
         quad.set_cursor(
             gl_state
@@ -1219,7 +1119,11 @@ impl super::TermWindow {
                 .cursor_sprite(cursor_shape)
                 .texture_coords(),
         );
-        quad.set_cursor_color(params.cursor_border_color);
+        quad.set_cursor_color(if self.config.force_reverse_video_cursor {
+            bg_color
+        } else {
+            params.cursor_border_color
+        });
 
         Ok(())
     }
@@ -1248,10 +1152,34 @@ impl super::TermWindow {
                     && params.config.cursor_blink_rate != 0
                     && self.focused.is_some();
                 if blinking {
+                    let now = std::time::Instant::now();
+
+                    // schedule an invalidation so that we can paint the next
+                    // cycle at the right time.
+                    if let Some(window) = self.window.clone() {
+                        let interval = Duration::from_millis(params.config.cursor_blink_rate);
+                        let next = *self.next_blink_paint.borrow();
+                        if next < now {
+                            let target = next + interval;
+                            let target = if target <= now {
+                                now + interval
+                            } else {
+                                target
+                            };
+
+                            *self.next_blink_paint.borrow_mut() = target;
+                            promise::spawn::spawn(async move {
+                                Timer::at(target).await;
+                                window.invalidate();
+                            })
+                            .detach();
+                        }
+                    }
+
                     // Divide the time since we last moved by the blink rate.
                     // If the result is even then the cursor is "on", else it
                     // is "off"
-                    let now = std::time::Instant::now();
+
                     let milli_uptime = now
                         .duration_since(self.prev_cursor.last_cursor_movement())
                         .as_millis();
@@ -1282,7 +1210,11 @@ impl super::TermWindow {
             // Cursor cell overrides colors
             (_, true, CursorShape::BlinkingBlock, CursorVisibility::Visible)
             | (_, true, CursorShape::SteadyBlock, CursorVisibility::Visible) => {
-                (params.cursor_fg, params.cursor_bg)
+                if self.config.force_reverse_video_cursor {
+                    (params.bg_color, params.fg_color)
+                } else {
+                    (params.cursor_fg, params.cursor_bg)
+                }
             }
             // Normally, render the cell as configured (or if the window is unfocused)
             _ => (params.fg_color, params.bg_color),
@@ -1318,6 +1250,71 @@ impl super::TermWindow {
             glyphs.push(glyph_cache.cached_glyph(info, &style, followed_by_space)?);
         }
         Ok(glyphs)
+    }
+
+    /// Shape the printable text from a cluster
+    fn cached_cluster_shape(
+        &self,
+        style: &TextStyle,
+        cluster: &CellCluster,
+        gl_state: &RenderState,
+        line: &Line,
+    ) -> anyhow::Result<Rc<Vec<ShapedInfo<SrgbTexture2d>>>> {
+        let shape_resolve_start = Instant::now();
+        let key = BorrowedShapeCacheKey {
+            style,
+            text: &cluster.text,
+        };
+        let glyph_info = match self.lookup_cached_shape(&key) {
+            Some(Ok(info)) => info,
+            Some(Err(err)) => return Err(err),
+            None => {
+                let font = self.fonts.resolve_font(style)?;
+                let window = self.window.as_ref().unwrap().clone();
+                match font.shape(
+                    &cluster.text,
+                    move || window.notify(TermWindowNotif::InvalidateShapeCache),
+                    BlockKey::filter_out_synthetic,
+                ) {
+                    Ok(info) => {
+                        let glyphs = self.glyph_infos_to_glyphs(
+                            cluster,
+                            line,
+                            &style,
+                            &mut gl_state.glyph_cache.borrow_mut(),
+                            &info,
+                        )?;
+                        let shaped = Rc::new(ShapedInfo::process(
+                            &self.render_metrics,
+                            cluster,
+                            &info,
+                            &glyphs,
+                        ));
+
+                        self.shape_cache
+                            .borrow_mut()
+                            .put(key.to_owned(), Ok(Rc::clone(&shaped)));
+                        shaped
+                    }
+                    Err(err) => {
+                        if err.root_cause().downcast_ref::<ClearShapeCache>().is_some() {
+                            return Err(err);
+                        }
+
+                        let res = anyhow!("shaper error: {}", err);
+                        self.shape_cache.borrow_mut().put(key.to_owned(), Err(err));
+                        return Err(res);
+                    }
+                }
+            }
+        };
+        metrics::histogram!("cached_cluster_shape", shape_resolve_start.elapsed());
+        log::trace!(
+            "shape_resolve for cluster len {} -> elapsed {:?}",
+            cluster.text.len(),
+            shape_resolve_start.elapsed()
+        );
+        Ok(glyph_info)
     }
 
     fn lookup_cached_shape(
@@ -1357,5 +1354,39 @@ fn rgbcolor_alpha_to_window_color(color: RgbColor, alpha: u8) -> LinearRgba {
     // Note `RgbColor` is intended to be SRGB, but in practice it appears
     // as though it is linear RGB, hence this is using with_rgba rather than
     // with_srgba.
-    LinearRgba::with_rgba(color.red, color.green, color.blue, alpha)
+    let (red, green, blue) = color.to_tuple_rgb8();
+    LinearRgba::with_rgba(red, green, blue, alpha)
+}
+
+fn resolve_fg_color_attr(
+    attrs: &CellAttributes,
+    fg: ColorAttribute,
+    params: &RenderScreenLineOpenGLParams,
+    style: &config::TextStyle,
+) -> RgbColor {
+    match fg {
+        wezterm_term::color::ColorAttribute::Default => {
+            if let Some(fg) = style.foreground {
+                fg
+            } else {
+                params.palette.resolve_fg(attrs.foreground())
+            }
+        }
+        wezterm_term::color::ColorAttribute::PaletteIndex(idx)
+            if idx < 8 && params.config.bold_brightens_ansi_colors =>
+        {
+            // For compatibility purposes, switch to a brighter version
+            // of one of the standard ANSI colors when Bold is enabled.
+            // This lifts black to dark grey.
+            let idx = if attrs.intensity() == wezterm_term::Intensity::Bold {
+                idx + 8
+            } else {
+                idx
+            };
+            params
+                .palette
+                .resolve_fg(wezterm_term::color::ColorAttribute::PaletteIndex(idx))
+        }
+        _ => params.palette.resolve_fg(fg),
+    }
 }

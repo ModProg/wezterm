@@ -3,6 +3,9 @@ use anyhow::Context;
 use promise::spawn::spawn;
 #[cfg(target_os = "macos")]
 use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
+use std::cell::RefCell;
+use std::rc::Rc;
+use wezterm_font::FontConfiguration;
 
 pub struct GpuContext {
     pub swap_chain: wgpu::SwapChain,
@@ -129,10 +132,12 @@ impl MyWindow {
             );
 
         self.gpu.replace(gpu);
+        self.paint(win)?;
         Ok(())
     }
 
-    fn paint(&mut self) -> anyhow::Result<()> {
+    fn paint(&mut self, win: &Window) -> anyhow::Result<()> {
+        self.fix_transparency(win);
         if let Some(gpu) = self.gpu.as_mut() {
             let frame = match gpu.swap_chain.get_current_frame() {
                 Ok(frame) => frame,
@@ -176,6 +181,19 @@ impl MyWindow {
         Ok(())
     }
 
+    fn fix_transparency(&mut self, win: &Window) {
+        #[cfg(target_os = "macos")]
+        if let RawWindowHandle::MacOS(h) = win.raw_window_handle() {
+            use cocoa::base::{id, NO};
+            use objc::*;
+            unsafe {
+                // Allow transparency, as the default for Metal is opaque
+                let layer: id = msg_send![h.ns_view as id, layer];
+                let () = msg_send![layer, setOpaque: NO];
+            }
+        }
+    }
+
     fn resize(&mut self, dims: Dimensions) {
         if self.dims == dims {
             // May just be a move event
@@ -188,36 +206,14 @@ impl MyWindow {
             gpu.swap_chain = gpu.device.create_swap_chain(&gpu.surface, &gpu.sc_desc);
         }
     }
-}
-
-async fn spawn_window() -> anyhow::Result<()> {
-    let (win, events) = Window::new_window("myclass", "the title", 800, 600, None).await?;
-
-    let mut state = MyWindow {
-        allow_close: false,
-        cursor_pos: Point::new(100, 200),
-        dims: Dimensions {
-            pixel_width: 800,
-            pixel_height: 600,
-            dpi: 0,
-        },
-        gpu: None,
-        render_pipeline: None,
-    };
-
-    eprintln!("before show");
-    win.show().await?;
-    state.enable_wgpu(&win).await?;
-    eprintln!("window is visible, do loop");
-
-    while let Ok(event) = events.recv().await {
+    fn dispatch(&mut self, event: WindowEvent, win: &Window) {
         match event {
             WindowEvent::CloseRequested => {
                 eprintln!("can I close?");
-                if state.allow_close {
+                if self.allow_close {
                     win.close();
                 } else {
-                    state.allow_close = true;
+                    self.allow_close = true;
                 }
             }
             WindowEvent::Destroyed => {
@@ -228,22 +224,12 @@ async fn spawn_window() -> anyhow::Result<()> {
                 dimensions,
                 is_full_screen: _,
             } => {
-                state.resize(dimensions);
+                self.resize(dimensions);
                 #[cfg(target_os = "macos")]
-                if let RawWindowHandle::MacOS(h) = win.raw_window_handle() {
-                    use cocoa::base::{id, NO};
-                    use objc::*;
-                    unsafe {
-                        // Allow transparency, as the default for Metal is opaque
-                        let layer: id = msg_send![h.ns_view as id, layer];
-                        let () = msg_send![layer, setOpaque: NO];
-                    }
-
-                    state.paint()?;
-                }
+                self.paint(win).unwrap();
             }
             WindowEvent::MouseEvent(event) => {
-                state.cursor_pos = event.coords;
+                self.cursor_pos = event.coords;
                 win.invalidate();
                 win.set_cursor(Some(MouseCursor::Arrow));
 
@@ -257,11 +243,52 @@ async fn spawn_window() -> anyhow::Result<()> {
                 win.default_key_processing(key);
             }
             WindowEvent::NeedRepaint => {
-                state.paint()?;
+                self.paint(win).unwrap();
             }
             WindowEvent::Notification(_) | WindowEvent::FocusChanged(_) => {}
         }
     }
+}
+
+async fn spawn_window() -> anyhow::Result<()> {
+    let fontconfig = Rc::new(FontConfiguration::new(
+        None,
+        ::window::default_dpi() as usize,
+    )?);
+    let state = Rc::new(RefCell::new(MyWindow {
+        allow_close: false,
+        cursor_pos: Point::new(100, 200),
+        dims: Dimensions {
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 0,
+        },
+        gpu: None,
+        render_pipeline: None,
+    }));
+
+    let cb_state = Rc::clone(&state);
+    let win = Window::new_window(
+        "myclass",
+        "the title",
+        800,
+        600,
+        None,
+        fontconfig,
+        move |event, window| {
+            let mut state = cb_state.borrow_mut();
+            state.dispatch(event, window)
+        },
+    )
+    .await?;
+
+    eprintln!("before show");
+    win.show();
+    {
+        let mut state = state.borrow_mut();
+        state.enable_wgpu(&win).await?;
+    }
+    eprintln!("window is visible, do loop");
 
     Ok(())
 }

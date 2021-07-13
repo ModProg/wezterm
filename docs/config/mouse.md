@@ -1,7 +1,21 @@
-Mouse bindings are configurable.
+Mouse bindings are configurable, and there are a number of default assignments
+described below.
 
 The assignments are based around a triggering mouse event which may be combined
 with a set of modifier keys to produce an action.
+
+By default applications running in the terminal don't respond to the mouse.
+However, applications can emit escape sequences to request mouse event tracking.
+When mouse event tracking is enabled, mouse events are NOT matched against
+the mouse assignments and are instead passed through to the application.
+
+You can bypass the mouse reporting capture by holding down the `SHIFT` key;
+that will prevent the event from being passed to the application and allow matching
+it against your assignments as though the `SHIFT` key were not pressed.
+
+The [bypass_mouse_reporting_modifiers](config/lua/config/bypass_mouse_reporting_modifiers.md)
+option allows you to specify an alternative set of modifiers to use for
+bypassing mouse reporting capture.
 
 ## Default Mouse Assignments
 
@@ -26,7 +40,7 @@ that order.
 | Triple Left Drag | `NONE`   | `ExtendSelectionToMouseCursor="Line"`  |
 | Single Middle Down | `NONE`   | `PasteFrom="PrimarySelection"`  |
 | Single Left Drag | `SUPER` | `StartWindowDrag` (*since 20210314-114017-04b7cedd*) |
-| Single Left Drag | `CTRL|SHIFT` | `StartWindowDrag` (*since 20210314-114017-04b7cedd*) |
+| Single Left Drag | `CTRL+SHIFT` | `StartWindowDrag` (*since 20210314-114017-04b7cedd*) |
 
 If you don't want the default assignments to be registered, you can
 disable all of them with this configuration; if you chose to do this,
@@ -70,6 +84,8 @@ return {
       mods="CTRL",
       action="OpenLinkAtMouseCursor",
     },
+    -- NOTE that binding only the 'Up' event can give unexpected behaviors.
+    -- Read more below on the gotcha of binding an 'Up' event only.
   },
 }
 ```
@@ -77,7 +93,7 @@ return {
 The `action` and `mods` portions are described in more detail in the key assignment
 information below.
 
-The `event` portion has three components;
+The `event` portion has three components:
 
 * Whether it is a `Down`, `Up` or `Drag` event
 * The number of consecutive clicks within the click threshold (the *click streak*)
@@ -99,6 +115,35 @@ you wanted quadruple-click bindings you can specify `streak=4`.
 | Double Left Up  | `event={Up={streak=2, button="Left"}}` |
 | Single Left Drag  | `event={Drag={streak=1, button="Left"}}` |
 
+
+# Gotcha on binding an 'Up' event only
+
+If you only have a mouse bind on the 'Up' event and not on the 'Down' event,
+the 'Down' event will still be sent to the running program.
+If that program is tracking mouse inputs (like tmux or vim with mouse support),
+you may experience _unintuitive behavior_ as the program receives the 'Down'
+event, but not the 'Up' event (which is bound to something in your config).
+
+To avoid this, it is recommended to disable the 'Down' event (to ensure it won't
+be sent to the running program), for example:
+```lua
+return {
+  mouse_bindings = {
+    -- Bind 'Up' event of CTRL-Click to open hyperlinks
+    {
+      event={Up={streak=1, button="Left"}},
+      mods="CTRL",
+      action="OpenLinkAtMouseCursor",
+    },
+    -- Disable the 'Down' event of CTRL-Click to avoid weird program behaviors
+    {
+      event={Down={streak=1, button="Left"}},
+      mods="CTRL",
+      action="Nop",
+    },
+  },
+}
+```
 
 
 # Available Actions

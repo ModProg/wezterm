@@ -2,8 +2,7 @@ use crate::tabbar::TabBarItem;
 use crate::termwindow::keyevent::window_mods_to_termwiz_mods;
 use crate::termwindow::{ScrollHit, TMB};
 use ::window::{
-    Modifiers, MouseButtons as WMB, MouseCursor, MouseEvent, MouseEventKind as WMEK, MousePress,
-    WindowOps,
+    MouseButtons as WMB, MouseCursor, MouseEvent, MouseEventKind as WMEK, MousePress, WindowOps,
 };
 use config::keyassignment::{MouseEventTrigger, SpawnTabDomain};
 use mux::pane::Pane;
@@ -18,7 +17,7 @@ use wezterm_term::input::MouseEventKind as TMEK;
 use wezterm_term::{LastMouseClick, StableRowIndex};
 
 impl super::TermWindow {
-    pub async fn mouse_event_impl(&mut self, event: MouseEvent, context: &dyn WindowOps) {
+    pub fn mouse_event_impl(&mut self, event: MouseEvent, context: &dyn WindowOps) {
         let pane = match self.get_active_pane_or_overlay() {
             Some(pane) => pane,
             None => return,
@@ -58,7 +57,7 @@ impl super::TermWindow {
             .sub(config.window_padding.left as isize)
             .max(0) as f32)
             / self.render_metrics.cell_size.width as f32;
-        let x = if !in_tab_bar {
+        let x = if !in_tab_bar && !pane.is_mouse_grabbed() {
             // Round the x coordinate so that we're a bit more forgiving of
             // the horizontal position when selecting cells
             x.round()
@@ -95,13 +94,6 @@ impl super::TermWindow {
             }
 
             WMEK::Press(ref press) => {
-                if let Some(focused) = self.focused.as_ref() {
-                    if focused.elapsed() <= Duration::from_millis(200) {
-                        log::trace!("discard mouse click because it focused the window");
-                        return;
-                    }
-                }
-
                 // Perform click counting
                 let button = mouse_press_to_tmb(press);
 
@@ -209,8 +201,7 @@ impl super::TermWindow {
         } else if in_scroll_bar {
             self.mouse_event_scroll_bar(pane, event, context);
         } else {
-            self.mouse_event_terminal(pane, x, term_y, event, context)
-                .await;
+            self.mouse_event_terminal(pane, x, term_y, event, context);
         }
     }
 
@@ -303,7 +294,7 @@ impl super::TermWindow {
         context.set_cursor(Some(MouseCursor::Arrow));
     }
 
-    pub async fn mouse_event_terminal(
+    pub fn mouse_event_terminal(
         &mut self,
         mut pane: Rc<dyn Pane>,
         mut x: usize,
@@ -383,6 +374,14 @@ impl super::TermWindow {
                 x = x.saturating_sub(pos.left);
                 y = y.saturating_sub(pos.top as i64);
                 break;
+            }
+        }
+        if let Some(focused) = self.focused.as_ref() {
+            if focused.elapsed() <= Duration::from_millis(200) {
+                if is_click_to_focus {
+                    context.invalidate();
+                }
+                return;
             }
         }
 
@@ -486,23 +485,27 @@ impl super::TermWindow {
             WMEK::VertWheel(_) | WMEK::HorzWheel(_) => None,
         };
 
-        let ignore_grab_modifier = Modifiers::SHIFT;
-
-        if !pane.is_mouse_grabbed() || event.modifiers.contains(ignore_grab_modifier) {
+        if !pane.is_mouse_grabbed()
+            || event
+                .modifiers
+                .contains(self.config.bypass_mouse_reporting_modifiers)
+        {
             if let Some(event_trigger_type) = event_trigger_type {
                 let mut modifiers = event.modifiers;
 
                 // Since we use shift to force assessing the mouse bindings, pretend
                 // that shift is not one of the mods when the mouse is grabbed.
                 if pane.is_mouse_grabbed() {
-                    modifiers -= ignore_grab_modifier;
+                    if modifiers.contains(self.config.bypass_mouse_reporting_modifiers) {
+                        modifiers.remove(self.config.bypass_mouse_reporting_modifiers);
+                    }
                 }
 
                 if let Some(action) = self
                     .input_map
                     .lookup_mouse(event_trigger_type.clone(), modifiers)
                 {
-                    self.perform_key_assignment(&pane, &action).await.ok();
+                    self.perform_key_assignment(&pane, &action).ok();
                     return;
                 }
             }

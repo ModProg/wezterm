@@ -1,23 +1,27 @@
 use crate::pane::{Pane, PaneId};
 use crate::tab::{Tab, TabId};
 use crate::window::{Window, WindowId};
-use anyhow::{anyhow, Error};
+use anyhow::{anyhow, Context, Error};
 use config::{configuration, ExitBehavior};
 use domain::{Domain, DomainId};
+use filedescriptor::{socketpair, AsRawSocketDescriptor, FileDescriptor};
+#[cfg(unix)]
+use libc::{SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
 use log::error;
+use metrics::histogram;
 use portable_pty::ExitStatus;
 use std::cell::{Ref, RefCell, RefMut};
 use std::collections::HashMap;
-use std::collections::VecDeque;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
-
+use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 use termwiz::escape::Action;
 use thiserror::*;
+#[cfg(windows)]
+use winapi::um::winsock2::{SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
 
 pub mod activity;
 pub mod connui;
@@ -61,17 +65,25 @@ pub struct Mux {
     banner: RefCell<Option<String>>,
 }
 
+const BUFSIZE: usize = 1024 * 1024;
+
 /// This function bounces parsed actions over to the main thread to feed to
 /// the pty in the mux.
 /// It blocks until the mux has finished consuming the data, which provides
 /// some back-pressure so that eg: ctrl-c can remain responsive.
 fn send_actions_to_mux(pane_id: PaneId, dead: &Arc<AtomicBool>, actions: Vec<Action>) {
+    let start = Instant::now();
     promise::spawn::block_on(promise::spawn::spawn_into_main_thread({
         let dead = Arc::clone(&dead);
         async move {
             let mux = Mux::get().unwrap();
             if let Some(pane) = mux.get_pane(pane_id) {
+                let start = Instant::now();
                 pane.perform_actions(actions);
+                histogram!(
+                    "send_actions_to_mux.perform_actions.latency",
+                    start.elapsed()
+                );
                 mux.notify(MuxNotification::PaneOutput(pane_id));
             } else {
                 // Something else removed the pane from
@@ -81,62 +93,49 @@ fn send_actions_to_mux(pane_id: PaneId, dead: &Arc<AtomicBool>, actions: Vec<Act
             }
         }
     }));
+    histogram!("send_actions_to_mux.latency", start.elapsed());
+    histogram!("send_actions_to_mux.rate", 1.);
 }
 
-struct BufState {
-    queue: Mutex<VecDeque<u8>>,
-    cond: Condvar,
-    dead: Arc<AtomicBool>,
-}
+fn parse_buffered_data(pane_id: PaneId, dead: &Arc<AtomicBool>, mut rx: FileDescriptor) {
+    let mut buf = vec![0; BUFSIZE];
+    let mut parser = termwiz::escape::parser::Parser::new();
 
-impl BufState {
-    fn write(&self, buf: &[u8]) {
-        let mut queue = self.queue.lock().unwrap();
-        queue.extend(buf);
-        self.cond.notify_one();
+    loop {
+        match rx.read(&mut buf) {
+            Ok(size) if size == 0 => {
+                dead.store(true, Ordering::Relaxed);
+                break;
+            }
+            Err(_) => {
+                dead.store(true, Ordering::Relaxed);
+                break;
+            }
+            Ok(size) => {
+                let mut actions = vec![];
+                parser.parse(&buf[0..size], |action| actions.push(action));
+                if !actions.is_empty() {
+                    send_actions_to_mux(pane_id, dead, actions);
+                }
+            }
+        }
     }
 }
 
-fn parse_buffered_data(pane_id: PaneId, state: &Arc<BufState>) {
-    let mut parser = termwiz::escape::parser::Parser::new();
-    let mut queue = state.queue.lock().unwrap();
-
-    loop {
-        if queue.is_empty() {
-            if state.dead.load(Ordering::Relaxed) {
-                return;
-            }
-            queue = state.cond.wait(queue).unwrap();
-            continue;
-        }
-
-        let mut actions = vec![];
-        let buf = queue.make_contiguous();
-        parser.parse(buf, |action| actions.push(action));
-        queue.truncate(0);
-
-        // Yield briefly to see if more data showed up and
-        // lump it together with what we've got
-        loop {
-            let wait_res = state
-                .cond
-                .wait_timeout(queue, Duration::from_millis(1))
-                .unwrap();
-            queue = wait_res.0;
-            if queue.is_empty() {
-                break;
-            }
-            let buf = queue.make_contiguous();
-            parser.parse(buf, |action| actions.push(action));
-            queue.truncate(0);
-            if !actions.is_empty() {
-                // Don't delay very long if we've got stuff to display!
-                break;
-            }
-        }
-
-        if !actions.is_empty() {
-            send_actions_to_mux(pane_id, &state.dead, actions);
+fn set_socket_buffer(fd: &mut FileDescriptor, option: i32, size: usize) -> anyhow::Result<()> {
+    let socklen = std::mem::size_of_val(&size);
+    unsafe {
+        let res = libc::setsockopt(
+            fd.as_socket_descriptor(),
+            SOL_SOCKET,
+            option,
+            &size as *const usize as *const _,
+            socklen as _,
+        );
+        if res == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error()).context("setsockopt")
         }
     }
 }
@@ -146,26 +145,23 @@ fn parse_buffered_data(pane_id: PaneId, state: &Arc<BufState>) {
 /// all platforms and pty/tty types), parse the escape sequences and
 /// relay the actions to the mux thread to apply them to the pane.
 fn read_from_pane_pty(pane_id: PaneId, banner: Option<String>, mut reader: Box<dyn std::io::Read>) {
-    const BUFSIZE: usize = 4 * 1024;
-    let mut buf = [0; BUFSIZE];
+    let mut buf = vec![0; BUFSIZE];
 
     // This is used to signal that an error occurred either in this thread,
     // or in the main mux thread.  If `true`, this thread will terminate.
     let dead = Arc::new(AtomicBool::new(false));
 
-    let state = Arc::new(BufState {
-        queue: Mutex::new(VecDeque::new()),
-        cond: Condvar::new(),
-        dead: Arc::clone(&dead),
-    });
+    let (mut tx, mut rx) = socketpair().unwrap();
+    set_socket_buffer(&mut tx, SO_SNDBUF, BUFSIZE).unwrap();
+    set_socket_buffer(&mut rx, SO_RCVBUF, BUFSIZE).unwrap();
 
     std::thread::spawn({
-        let state = Arc::clone(&state);
-        move || parse_buffered_data(pane_id, &state)
+        let dead = Arc::clone(&dead);
+        move || parse_buffered_data(pane_id, &dead, rx)
     });
 
     if let Some(banner) = banner {
-        state.write(banner.as_bytes());
+        tx.write_all(banner.as_bytes()).ok();
     }
 
     while !dead.load(Ordering::Relaxed) {
@@ -179,7 +175,14 @@ fn read_from_pane_pty(pane_id: PaneId, banner: Option<String>, mut reader: Box<d
                 break;
             }
             Ok(size) => {
-                state.write(&buf[..size]);
+                histogram!("read_from_pane_pty.bytes.rate", size as f64);
+                if let Err(err) = tx.write_all(&buf[..size]) {
+                    error!(
+                        "read_pty failed to write to parser: pane {} {:?}",
+                        pane_id, err
+                    );
+                    break;
+                }
             }
         }
     }

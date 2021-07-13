@@ -6,7 +6,7 @@ use crate::connection::ConnectionOps;
 use crate::{
     Clipboard, Connection, Dimensions, KeyCode, KeyEvent, Modifiers, MouseButtons, MouseCursor,
     MouseEvent, MouseEventKind, MousePress, Point, Rect, ScreenPoint, Size, WindowDecorations,
-    WindowEvent, WindowEventReceiver, WindowEventSender, WindowOps,
+    WindowEvent, WindowEventSender, WindowOps,
 };
 use anyhow::{anyhow, bail, ensure};
 use async_trait::async_trait;
@@ -39,6 +39,7 @@ use std::ffi::c_void;
 use std::rc::Rc;
 use std::str::FromStr;
 use std::time::Instant;
+use wezterm_font::FontConfiguration;
 
 #[allow(non_upper_case_globals)]
 const NSViewLayerContentsPlacementTopLeft: NSInteger = 11;
@@ -357,21 +358,32 @@ fn function_key_to_keycode(function_key: char) -> KeyCode {
 }
 
 #[derive(Debug, Clone)]
-pub struct Window(usize);
+pub struct Window {
+    id: usize,
+    ns_window: *mut Object,
+    ns_view: *mut Object,
+}
+
+unsafe impl Send for Window {}
+unsafe impl Sync for Window {}
 
 impl Window {
-    pub async fn new_window(
+    pub async fn new_window<F>(
         _class_name: &str,
         name: &str,
         width: usize,
         height: usize,
         config: Option<&ConfigHandle>,
-    ) -> anyhow::Result<(Window, WindowEventReceiver)> {
+        _font_config: Rc<FontConfiguration>,
+        event_handler: F,
+    ) -> anyhow::Result<Window>
+    where
+        F: 'static + FnMut(WindowEvent, &Window),
+    {
         let config = match config {
             Some(c) => c.clone(),
             None => config::configuration(),
         };
-        let (events, receiver) = async_channel::unbounded();
 
         unsafe {
             let style_mask = decoration_to_mask(config.window_decorations);
@@ -383,6 +395,7 @@ impl Window {
             let conn = Connection::get().expect("Connection::init has not been called");
 
             let window_id = conn.next_window_id();
+            let events = WindowEventSender::new(event_handler);
 
             let inner = Rc::new(RefCell::new(Inner {
                 events,
@@ -462,6 +475,11 @@ impl Window {
             let height = backing_frame.size.height;
 
             let weak_window = window.weak();
+            let window_handle = Window {
+                id: window_id,
+                ns_window: *window,
+                ns_view: *view,
+            };
             let window_inner = Rc::new(RefCell::new(WindowInner {
                 window,
                 view,
@@ -472,48 +490,45 @@ impl Window {
                 .borrow_mut()
                 .insert(window_id, Rc::clone(&window_inner));
 
-            let window = Window(window_id);
-            window.config_did_change(&config);
+            inner
+                .borrow_mut()
+                .events
+                .assign_window(window_handle.clone());
+
+            window_handle.config_did_change(&config);
 
             // Synthesize a resize event immediately; this allows
             // the embedding application an opportunity to discover
             // the dpi and adjust for display scaling
-            inner
-                .borrow_mut()
-                .events
-                .try_send(WindowEvent::Resized {
-                    dimensions: Dimensions {
-                        pixel_width: width as usize,
-                        pixel_height: height as usize,
-                        dpi: (crate::DEFAULT_DPI * (backing_frame.size.width / frame.size.width))
-                            as usize,
-                    },
-                    is_full_screen: false,
-                })
-                .ok();
+            inner.borrow_mut().events.dispatch(WindowEvent::Resized {
+                dimensions: Dimensions {
+                    pixel_width: width as usize,
+                    pixel_height: height as usize,
+                    dpi: (crate::DEFAULT_DPI * (backing_frame.size.width / frame.size.width))
+                        as usize,
+                },
+                is_full_screen: false,
+            });
 
-            Ok((window, receiver))
+            Ok(window_handle)
         }
     }
 }
 
 unsafe impl HasRawWindowHandle for Window {
     fn raw_window_handle(&self) -> RawWindowHandle {
-        let conn = Connection::get().expect("raw_window_handle only callable on main thread");
-        let handle = conn.window_by_id(self.0).expect("window handle invalid!?");
-
-        let inner = handle.borrow();
-        let window_view =
-            WindowView::get_this(unsafe { &**inner.view }).expect("window view invalid!?");
-
-        window_view.inner.borrow().raw_window_handle()
+        RawWindowHandle::MacOS(MacOSHandle {
+            ns_window: self.ns_window as *mut _,
+            ns_view: self.ns_view as *mut _,
+            ..MacOSHandle::empty()
+        })
     }
 }
 
 #[async_trait(?Send)]
 impl WindowOps for Window {
     async fn enable_opengl(&self) -> anyhow::Result<Rc<glium::backend::Context>> {
-        let window_id = self.0;
+        let window_id = self.id;
         promise::spawn::spawn(async move {
             if let Some(handle) = Connection::get().unwrap().window_by_id(window_id) {
                 let mut inner = handle.borrow_mut();
@@ -529,96 +544,80 @@ impl WindowOps for Window {
     where
         Self: Sized,
     {
-        // If we're already on the correct thread, just queue it up
-        if let Some(conn) = Connection::get() {
-            let handle = match conn.window_by_id(self.0) {
-                Some(h) => h,
-                None => return,
-            };
-            let inner = handle.borrow();
+        Connection::with_window_inner(self.id, move |inner| {
             if let Some(window_view) = WindowView::get_this(unsafe { &**inner.view }) {
                 window_view
                     .inner
-                    .borrow()
+                    .borrow_mut()
                     .events
-                    .try_send(WindowEvent::Notification(Box::new(t)))
-                    .ok();
+                    .dispatch(WindowEvent::Notification(Box::new(t)));
             }
-        } else {
-            // Otherwise, get into that thread and write to the queue
-            Connection::with_window_inner(self.0, move |inner| {
-                if let Some(window_view) = WindowView::get_this(unsafe { &**inner.view }) {
-                    window_view
-                        .inner
-                        .borrow()
-                        .events
-                        .try_send(WindowEvent::Notification(Box::new(t)))
-                        .ok();
-                }
-                Ok(())
-            });
-        }
+            Ok(())
+        });
     }
 
-    fn close(&self) -> Future<()> {
-        Connection::with_window_inner(self.0, |inner| {
+    fn close(&self) {
+        Connection::with_window_inner(self.id, |inner| {
             inner.close();
             Ok(())
-        })
+        });
     }
 
-    fn hide(&self) -> Future<()> {
-        Connection::with_window_inner(self.0, |inner| {
+    fn hide(&self) {
+        Connection::with_window_inner(self.id, |inner| {
             inner.hide();
             Ok(())
-        })
+        });
     }
 
-    fn show(&self) -> Future<()> {
-        Connection::with_window_inner(self.0, |inner| {
+    fn show(&self) {
+        Connection::with_window_inner(self.id, |inner| {
             inner.show();
             Ok(())
-        })
+        });
     }
 
-    fn set_cursor(&self, cursor: Option<MouseCursor>) -> Future<()> {
-        Connection::with_window_inner(self.0, move |inner| {
+    fn set_cursor(&self, cursor: Option<MouseCursor>) {
+        Connection::with_window_inner(self.id, move |inner| {
             let _ = inner.set_cursor(cursor);
             Ok(())
-        })
+        });
     }
 
-    fn invalidate(&self) -> Future<()> {
-        Connection::with_window_inner(self.0, |inner| {
+    fn invalidate(&self) {
+        Connection::with_window_inner(self.id, |inner| {
             inner.invalidate();
             Ok(())
-        })
+        });
     }
 
-    fn set_title(&self, title: &str) -> Future<()> {
+    fn set_title(&self, title: &str) {
         let title = title.to_owned();
-        Connection::with_window_inner(self.0, move |inner| {
+        Connection::with_window_inner(self.id, move |inner| {
             inner.set_title(&title);
             Ok(())
-        })
+        });
     }
 
-    fn set_inner_size(&self, width: usize, height: usize) -> Future<Dimensions> {
-        Connection::with_window_inner(self.0, move |inner| Ok(inner.set_inner_size(width, height)))
+    fn set_inner_size(&self, width: usize, height: usize) {
+        Connection::with_window_inner(
+            self.id,
+            move |inner| Ok(inner.set_inner_size(width, height)),
+        );
     }
 
-    fn set_window_position(&self, coords: ScreenPoint) -> Future<()> {
-        Connection::with_window_inner(self.0, move |inner| {
+    fn set_window_position(&self, coords: ScreenPoint) {
+        Connection::with_window_inner(self.id, move |inner| {
             inner.set_window_position(coords);
             Ok(())
-        })
+        });
     }
 
-    fn set_text_cursor_position(&self, cursor: Rect) -> Future<()> {
-        Connection::with_window_inner(self.0, move |inner| {
+    fn set_text_cursor_position(&self, cursor: Rect) {
+        Connection::with_window_inner(self.id, move |inner| {
             inner.set_text_cursor_position(cursor);
             Ok(())
-        })
+        });
     }
 
     fn get_clipboard(&self, _clipboard: Clipboard) -> Future<String> {
@@ -630,28 +629,26 @@ impl WindowOps for Window {
         )
     }
 
-    fn set_clipboard(&self, _clipboard: Clipboard, text: String) -> Future<()> {
+    fn set_clipboard(&self, _clipboard: Clipboard, text: String) {
         use clipboard::ClipboardProvider;
-        Future::result(
-            clipboard::ClipboardContext::new()
-                .and_then(|mut ctx| ctx.set_contents(text))
-                .map_err(|e| anyhow!("Failed to set clipboard:{}", e)),
-        )
+        clipboard::ClipboardContext::new()
+            .and_then(|mut ctx| ctx.set_contents(text))
+            .ok();
     }
 
-    fn toggle_fullscreen(&self) -> Future<()> {
-        Connection::with_window_inner(self.0, move |inner| {
+    fn toggle_fullscreen(&self) {
+        Connection::with_window_inner(self.id, move |inner| {
             inner.toggle_fullscreen();
             Ok(())
-        })
+        });
     }
 
-    fn config_did_change(&self, config: &ConfigHandle) -> Future<()> {
+    fn config_did_change(&self, config: &ConfigHandle) {
         let config = config.clone();
-        Connection::with_window_inner(self.0, move |inner| {
+        Connection::with_window_inner(self.id, move |inner| {
             inner.config_did_change(&config);
             Ok(())
-        })
+        });
     }
 }
 
@@ -1005,18 +1002,6 @@ struct Inner {
     config: ConfigHandle,
 }
 
-unsafe impl HasRawWindowHandle for Inner {
-    fn raw_window_handle(&self) -> RawWindowHandle {
-        let ns_window = self.window.as_ref().unwrap().load();
-        let ns_view = self.view_id.as_ref().unwrap().load();
-        RawWindowHandle::MacOS(MacOSHandle {
-            ns_window: *ns_window as *mut _,
-            ns_view: *ns_view as *mut _,
-            ..MacOSHandle::empty()
-        })
-    }
-}
-
 #[repr(C)]
 pub struct __InputSource {
     _dummy: i32,
@@ -1354,8 +1339,8 @@ impl WindowView {
         .normalize_shift();
 
         if let Some(myself) = Self::get_this(this) {
-            let inner = myself.inner.borrow();
-            inner.events.try_send(WindowEvent::KeyEvent(event)).ok();
+            let mut inner = myself.inner.borrow_mut();
+            inner.events.dispatch(WindowEvent::KeyEvent(event));
         }
     }
 
@@ -1394,7 +1379,7 @@ impl WindowView {
             }
             .normalize_shift();
 
-            inner.events.try_send(WindowEvent::KeyEvent(event)).ok();
+            inner.events.dispatch(WindowEvent::KeyEvent(event));
         }
     }
 
@@ -1483,6 +1468,10 @@ impl WindowView {
         }
     }
 
+    extern "C" fn accepts_first_mouse(_this: &mut Object, _sel: Sel, _nsevent: id) -> BOOL {
+        YES
+    }
+
     extern "C" fn accepts_first_responder(_this: &mut Object, _sel: Sel) -> BOOL {
         YES
     }
@@ -1493,17 +1482,11 @@ impl WindowView {
         }
 
         if let Some(this) = Self::get_this(this) {
-            if this
-                .inner
+            this.inner
                 .borrow_mut()
                 .events
-                .try_send(WindowEvent::CloseRequested)
-                .is_err()
-            {
-                YES
-            } else {
-                NO
-            }
+                .dispatch(WindowEvent::CloseRequested);
+            NO
         } else {
             YES
         }
@@ -1514,8 +1497,7 @@ impl WindowView {
             this.inner
                 .borrow_mut()
                 .events
-                .try_send(WindowEvent::FocusChanged(true))
-                .ok();
+                .dispatch(WindowEvent::FocusChanged(true));
         }
     }
 
@@ -1524,8 +1506,7 @@ impl WindowView {
             this.inner
                 .borrow_mut()
                 .events
-                .try_send(WindowEvent::FocusChanged(false))
-                .ok();
+                .dispatch(WindowEvent::FocusChanged(false));
         }
     }
 
@@ -1551,8 +1532,7 @@ impl WindowView {
             this.inner
                 .borrow_mut()
                 .events
-                .try_send(WindowEvent::Destroyed)
-                .ok();
+                .dispatch(WindowEvent::Destroyed);
         }
 
         // Release and zero out the inner member
@@ -1588,8 +1568,8 @@ impl WindowView {
         };
 
         if let Some(myself) = Self::get_this(this) {
-            let inner = myself.inner.borrow();
-            inner.events.try_send(WindowEvent::MouseEvent(event)).ok();
+            let mut inner = myself.inner.borrow_mut();
+            inner.events.dispatch(WindowEvent::MouseEvent(event));
         }
     }
 
@@ -1878,8 +1858,8 @@ impl WindowView {
             );
 
             if let Some(myself) = Self::get_this(this) {
-                let inner = myself.inner.borrow();
-                inner.events.try_send(WindowEvent::KeyEvent(event)).ok();
+                let mut inner = myself.inner.borrow_mut();
+                inner.events.dispatch(WindowEvent::KeyEvent(event));
             }
         }
     }
@@ -1917,7 +1897,7 @@ impl WindowView {
         let width = backing_frame.size.width;
         let height = backing_frame.size.height;
         if let Some(this) = Self::get_this(this) {
-            let inner = this.inner.borrow();
+            let mut inner = this.inner.borrow_mut();
 
             // This is a little gross; ideally we'd call
             // WindowInner:is_fullscreen to determine this, but
@@ -1932,18 +1912,15 @@ impl WindowView {
                     style_mask.contains(NSWindowStyleMask::NSFullScreenWindowMask)
                 });
 
-            inner
-                .events
-                .try_send(WindowEvent::Resized {
-                    dimensions: Dimensions {
-                        pixel_width: width as usize,
-                        pixel_height: height as usize,
-                        dpi: (crate::DEFAULT_DPI * (backing_frame.size.width / frame.size.width))
-                            as usize,
-                    },
-                    is_full_screen,
-                })
-                .ok();
+            inner.events.dispatch(WindowEvent::Resized {
+                dimensions: Dimensions {
+                    pixel_width: width as usize,
+                    pixel_height: height as usize,
+                    dpi: (crate::DEFAULT_DPI * (backing_frame.size.width / frame.size.width))
+                        as usize,
+                },
+                is_full_screen,
+            });
         }
     }
 
@@ -1963,7 +1940,7 @@ impl WindowView {
                 return;
             }
 
-            inner.events.try_send(WindowEvent::NeedRepaint).ok();
+            inner.events.dispatch(WindowEvent::NeedRepaint);
         }
     }
 
@@ -2116,6 +2093,11 @@ impl WindowView {
             cls.add_method(
                 sel!(acceptsFirstResponder),
                 Self::accepts_first_responder as extern "C" fn(&mut Object, Sel) -> BOOL,
+            );
+
+            cls.add_method(
+                sel!(acceptsFirstMouse:),
+                Self::accepts_first_mouse as extern "C" fn(&mut Object, Sel, id) -> BOOL,
             );
 
             // NSTextInputClient

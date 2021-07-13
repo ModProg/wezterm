@@ -3,13 +3,13 @@ use crate::connection::ConnectionOps;
 use crate::{
     Clipboard, Dimensions, KeyCode, KeyEvent, Modifiers, MouseButtons, MouseCursor, MouseEvent,
     MouseEventKind, MousePress, Point, Rect, ScreenPoint, WindowDecorations, WindowEvent,
-    WindowEventReceiver, WindowEventSender, WindowOps,
+    WindowEventSender, WindowOps,
 };
 use anyhow::{bail, Context};
 use async_trait::async_trait;
 use config::ConfigHandle;
 use lazy_static::lazy_static;
-use promise::{Future, Promise};
+use promise::Future;
 use raw_window_handle::windows::WindowsHandle;
 use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
 use shared_library::shared_library;
@@ -22,6 +22,7 @@ use std::io::{self, Error as IoError};
 use std::os::windows::ffi::OsStringExt;
 use std::ptr::{null, null_mut};
 use std::rc::Rc;
+use wezterm_font::FontConfiguration;
 use winapi::shared::minwindef::*;
 use winapi::shared::ntdef::*;
 use winapi::shared::windef::*;
@@ -216,12 +217,10 @@ impl WindowInner {
             let imc = ImmContext::get(self.hwnd.0);
             imc.set_position(0, 0);
 
-            self.events
-                .try_send(WindowEvent::Resized {
-                    dimensions: current_dims,
-                    is_full_screen: self.saved_placement.is_some(),
-                })
-                .ok();
+            self.events.dispatch(WindowEvent::Resized {
+                dimensions: current_dims,
+                is_full_screen: self.saved_placement.is_some(),
+            });
         }
 
         !same
@@ -372,14 +371,20 @@ impl Window {
         Ok(hwnd)
     }
 
-    pub async fn new_window(
+    pub async fn new_window<F>(
         class_name: &str,
         name: &str,
         width: usize,
         height: usize,
         config: Option<&ConfigHandle>,
-    ) -> anyhow::Result<(Window, WindowEventReceiver)> {
-        let (events, receiver) = async_channel::unbounded();
+        _font_config: Rc<FontConfiguration>,
+        event_handler: F,
+    ) -> anyhow::Result<Window>
+    where
+        F: 'static + FnMut(WindowEvent, &Window),
+    {
+        let events = WindowEventSender::new(event_handler);
+
         let config = match config {
             Some(c) => c.clone(),
             None => config::configuration(),
@@ -409,6 +414,11 @@ impl Window {
                 return Err(err);
             }
         };
+        let window_handle = Window(hwnd);
+        inner
+            .borrow_mut()
+            .events
+            .assign_window(window_handle.clone());
 
         enable_dark_mode(hwnd.0);
         enable_blur_behind(hwnd.0);
@@ -419,10 +429,7 @@ impl Window {
             .borrow_mut()
             .insert(hwnd.clone(), Rc::clone(&inner));
 
-        let window = Window(hwnd);
-        // inner.borrow_mut().enable_opengl()?;
-
-        Ok((window, receiver))
+        Ok(window_handle)
     }
 }
 
@@ -578,97 +585,75 @@ impl WindowOps for Window {
     where
         Self: Sized,
     {
-        // If we're already on the correct thread, just queue it up
-        if let Some(conn) = Connection::get() {
-            let handle = match conn.get_window(self.0) {
-                Some(h) => h,
-                None => return,
-            };
-            let inner = handle.borrow_mut();
+        Connection::with_window_inner(self.0, move |inner| {
             inner
                 .events
-                .try_send(WindowEvent::Notification(Box::new(t)))
-                .ok();
-        } else {
-            // Otherwise, get into that thread and write to the queue
-            Connection::with_window_inner(self.0, move |inner| {
-                inner
-                    .events
-                    .try_send(WindowEvent::Notification(Box::new(t)))
-                    .ok();
-                Ok(())
-            });
-        }
+                .dispatch(WindowEvent::Notification(Box::new(t)));
+            Ok(())
+        });
     }
 
-    fn close(&self) -> Future<()> {
+    fn close(&self) {
         Connection::with_window_inner(self.0, |inner| {
             inner.close();
             Ok(())
-        })
+        });
     }
 
-    fn show(&self) -> Future<()> {
+    fn show(&self) {
         schedule_show_window(self.0, true);
-        Future::ok(()) // FIXME: this is a lie!
     }
 
-    fn hide(&self) -> Future<()> {
+    fn hide(&self) {
         schedule_show_window(self.0, false);
-        Future::ok(()) // FIXME: this is a lie!
     }
 
-    fn set_cursor(&self, cursor: Option<MouseCursor>) -> Future<()> {
+    fn set_cursor(&self, cursor: Option<MouseCursor>) {
         Connection::with_window_inner(self.0, move |inner| {
             inner.set_cursor(cursor);
             Ok(())
-        })
+        });
     }
 
-    fn invalidate(&self) -> Future<()> {
+    fn invalidate(&self) {
         let hwnd = self.0 .0;
         log::trace!("WindowOps::invalidate calling InvalidateRect");
         unsafe {
             InvalidateRect(hwnd, null(), 0);
         }
-        Future::ok(())
     }
 
-    fn set_title(&self, title: &str) -> Future<()> {
+    fn set_title(&self, title: &str) {
         let title = title.to_owned();
         Connection::with_window_inner(self.0, move |inner| {
             inner.set_title(&title);
             Ok(())
-        })
+        });
     }
 
-    fn toggle_fullscreen(&self) -> Future<()> {
+    fn toggle_fullscreen(&self) {
         Connection::with_window_inner(self.0, move |inner| {
             inner.toggle_fullscreen();
             Ok(())
-        })
+        });
     }
 
-    fn config_did_change(&self, config: &ConfigHandle) -> Future<()> {
+    fn config_did_change(&self, config: &ConfigHandle) {
         let config = config.clone();
         Connection::with_window_inner(self.0, move |inner| {
             inner.config_did_change(&config);
             Ok(())
-        })
+        });
     }
 
-    fn set_text_cursor_position(&self, cursor: Rect) -> Future<()> {
+    fn set_text_cursor_position(&self, cursor: Rect) {
         Connection::with_window_inner(self.0, move |inner| {
             inner.set_text_cursor_position(cursor);
             Ok(())
-        })
+        });
     }
 
-    fn set_inner_size(&self, width: usize, height: usize) -> Future<Dimensions> {
-        let mut promise = Promise::new();
-        let future = promise.get_future().unwrap();
-        let mut promise = Some(promise);
-
+    fn set_inner_size(&self, width: usize, height: usize) {
         Connection::with_window_inner(self.0, move |inner| {
             let (width, height) = adjust_client_to_window_dimensions(
                 decorations_to_style(inner.config.window_decorations),
@@ -676,7 +661,6 @@ impl WindowOps for Window {
                 height,
             );
             let hwnd = inner.hwnd;
-            let mut promise = promise.take();
             promise::spawn::spawn(async move {
                 unsafe {
                     SetWindowPos(
@@ -690,39 +674,17 @@ impl WindowOps for Window {
                     );
                     wm_paint(hwnd.0, 0, 0, 0);
                 }
-
-                let mut rect = RECT {
-                    left: 0,
-                    bottom: 0,
-                    right: 0,
-                    top: 0,
-                };
-                unsafe {
-                    GetClientRect(hwnd.0, &mut rect);
-                }
-                let pixel_width = rect_width(&rect) as usize;
-                let pixel_height = rect_height(&rect) as usize;
-
-                if let Some(mut promise) = promise.take() {
-                    promise.ok(Dimensions {
-                        pixel_width,
-                        pixel_height,
-                        dpi: unsafe { GetDpiForWindow(hwnd.0) as usize },
-                    });
-                }
             })
             .detach();
             Ok(())
         });
-
-        future
     }
 
-    fn set_window_position(&self, coords: ScreenPoint) -> Future<()> {
+    fn set_window_position(&self, coords: ScreenPoint) {
         Connection::with_window_inner(self.0, move |inner| {
             inner.set_window_position(coords);
             Ok(())
-        })
+        });
     }
 
     fn get_clipboard(&self, _clipboard: Clipboard) -> Future<String> {
@@ -733,10 +695,8 @@ impl WindowOps for Window {
         )
     }
 
-    fn set_clipboard(&self, _clipboard: Clipboard, text: String) -> Future<()> {
-        Future::result(
-            clipboard_win::set_clipboard_string(&text).context("Error setting clipboard"),
-        )
+    fn set_clipboard(&self, _clipboard: Clipboard, text: String) {
+        clipboard_win::set_clipboard_string(&text).ok();
     }
 }
 
@@ -765,7 +725,7 @@ unsafe fn wm_ncdestroy(
     if !raw.is_null() {
         let inner = take_rc_from_pointer(raw);
         let mut inner = inner.borrow_mut();
-        inner.events.try_send(WindowEvent::Destroyed).ok();
+        inner.events.dispatch(WindowEvent::Destroyed);
         inner.hwnd = HWindow(null_mut());
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
     }
@@ -915,8 +875,10 @@ unsafe fn wm_set_focus(
     _lparam: LPARAM,
 ) -> Option<LRESULT> {
     if let Some(inner) = rc_from_hwnd(hwnd) {
-        let inner = inner.borrow();
-        inner.events.try_send(WindowEvent::FocusChanged(true)).ok();
+        inner
+            .borrow_mut()
+            .events
+            .dispatch(WindowEvent::FocusChanged(true));
     }
     None
 }
@@ -928,15 +890,17 @@ unsafe fn wm_kill_focus(
     _lparam: LPARAM,
 ) -> Option<LRESULT> {
     if let Some(inner) = rc_from_hwnd(hwnd) {
-        let inner = inner.borrow();
-        inner.events.try_send(WindowEvent::FocusChanged(false)).ok();
+        inner
+            .borrow_mut()
+            .events
+            .dispatch(WindowEvent::FocusChanged(false));
     }
     None
 }
 
 unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> Option<LRESULT> {
     if let Some(inner) = rc_from_hwnd(hwnd) {
-        let inner = inner.borrow();
+        let mut inner = inner.borrow_mut();
 
         let mut ps = PAINTSTRUCT {
             fErase: 0,
@@ -956,7 +920,7 @@ unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> 
         EndPaint(hwnd, &mut ps);
 
         // Ask the app to repaint in a bit
-        inner.events.try_send(WindowEvent::NeedRepaint).ok();
+        inner.events.dispatch(WindowEvent::NeedRepaint);
 
         Some(0)
     } else {
@@ -1060,8 +1024,10 @@ unsafe fn mouse_button(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) ->
             mouse_buttons,
             modifiers,
         };
-        let inner = inner.borrow();
-        inner.events.try_send(WindowEvent::MouseEvent(event)).ok();
+        inner
+            .borrow_mut()
+            .events
+            .dispatch(WindowEvent::MouseEvent(event));
         Some(0)
     } else {
         None
@@ -1080,8 +1046,10 @@ unsafe fn mouse_move(hwnd: HWND, _msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
             modifiers,
         };
 
-        let inner = inner.borrow();
-        inner.events.try_send(WindowEvent::MouseEvent(event)).ok();
+        inner
+            .borrow_mut()
+            .events
+            .dispatch(WindowEvent::MouseEvent(event));
         Some(0)
     } else {
         None
@@ -1135,8 +1103,10 @@ unsafe fn mouse_wheel(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
             mouse_buttons,
             modifiers,
         };
-        let inner = inner.borrow();
-        inner.events.try_send(WindowEvent::MouseEvent(event)).ok();
+        inner
+            .borrow_mut()
+            .events
+            .dispatch(WindowEvent::MouseEvent(event));
         Some(0)
     } else {
         None
@@ -1193,7 +1163,7 @@ unsafe fn ime_composition(
     lparam: LPARAM,
 ) -> Option<LRESULT> {
     if let Some(inner) = rc_from_hwnd(hwnd) {
-        let inner = inner.borrow();
+        let mut inner = inner.borrow_mut();
 
         if (lparam as DWORD) & GCS_RESULTSTR == 0 {
             // No finished result; continue with the default
@@ -1226,7 +1196,7 @@ unsafe fn ime_composition(
                         key_is_down: true,
                     }
                     .normalize_shift();
-                    inner.events.try_send(WindowEvent::KeyEvent(key)).ok();
+                    inner.events.dispatch(WindowEvent::KeyEvent(key));
 
                     return Some(1);
                 }
@@ -1783,7 +1753,7 @@ unsafe fn key(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> Option<L
                             .normalize_shift()
                             .normalize_ctrl();
 
-                            inner.events.try_send(WindowEvent::KeyEvent(key)).ok();
+                            inner.events.dispatch(WindowEvent::KeyEvent(key));
 
                             // And then we'll perform normal processing on the
                             // current key press
@@ -1893,7 +1863,7 @@ unsafe fn key(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> Option<L
                 return None;
             }
 
-            inner.events.try_send(WindowEvent::KeyEvent(key)).ok();
+            inner.events.dispatch(WindowEvent::KeyEvent(key));
             return Some(0);
         }
     }
@@ -1926,14 +1896,10 @@ unsafe fn do_wnd_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
         WM_ERASEBKGND => Some(1),
         WM_CLOSE => {
             if let Some(inner) = rc_from_hwnd(hwnd) {
-                let inner = inner.borrow();
-                if inner.events.try_send(WindowEvent::CloseRequested).is_err() {
-                    // Close it!
-                    return None;
-                } else {
-                    // Don't let it close
-                    return Some(0);
-                }
+                let mut inner = inner.borrow_mut();
+                inner.events.dispatch(WindowEvent::CloseRequested);
+                // Don't let it close
+                return Some(0);
             }
             None
         }

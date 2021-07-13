@@ -63,8 +63,8 @@ impl TerminfoRenderer {
         }
 
         if let Some(attr) = self.pending_attr.take() {
-            let mut current_foreground = self.current_attr.foreground;
-            let mut current_background = self.current_attr.background;
+            let mut current_foreground = self.current_attr.foreground();
+            let mut current_background = self.current_attr.background();
 
             if !attr.attribute_bits_equal(&self.current_attr) {
                 // Updating the attribute bits also resets the colors.
@@ -130,8 +130,8 @@ impl TerminfoRenderer {
                 None => 0,
             };
 
-            if attr.foreground != current_foreground {
-                match (has_true_color, attr.foreground) {
+            if attr.foreground() != current_foreground {
+                match (has_true_color, attr.foreground()) {
                     (true, ColorAttribute::TrueColorWithPaletteFallback(tc, _))
                     | (true, ColorAttribute::TrueColorWithDefaultFallback(tc)) => {
                         write!(
@@ -164,8 +164,8 @@ impl TerminfoRenderer {
                 }
             }
 
-            if attr.background != current_background {
-                match (has_true_color, attr.background) {
+            if attr.background() != current_background {
+                match (has_true_color, attr.background()) {
                     (true, ColorAttribute::TrueColorWithPaletteFallback(tc, _))
                     | (true, ColorAttribute::TrueColorWithDefaultFallback(tc)) => {
                         write!(
@@ -335,7 +335,8 @@ impl TerminfoRenderer {
                     }
                     self.pending_attr = None;
 
-                    if self.current_attr.background == ColorAttribute::Default || self.caps.bce() {
+                    if self.current_attr.background() == ColorAttribute::Default || self.caps.bce()
+                    {
                         // The erase operation respects "background color erase",
                         // or we're clearing to the default background color, so we can
                         // simply emit a clear screen op.
@@ -427,10 +428,14 @@ impl TerminfoRenderer {
                     record!(set_underline, value);
                 }
                 Change::Attribute(AttributeChange::Foreground(col)) => {
-                    self.attr_apply(|attr| attr.foreground = *col);
+                    self.attr_apply(|attr| {
+                        attr.set_foreground(*col);
+                    });
                 }
                 Change::Attribute(AttributeChange::Background(col)) => {
-                    self.attr_apply(|attr| attr.background = *col);
+                    self.attr_apply(|attr| {
+                        attr.set_background(*col);
+                    });
                 }
                 Change::Attribute(AttributeChange::Hyperlink(link)) => {
                     self.attr_apply(|attr| {
@@ -1170,7 +1175,7 @@ mod test {
         let mut out = FakeTerm::new(xterm_terminfo());
         out.render(&[
             Change::Attribute(AttributeChange::Foreground(
-                ColorSpec::TrueColor(RgbColor::new(255, 128, 64)).into(),
+                ColorSpec::TrueColor(RgbColor::new_8bpc(255, 128, 64)).into(),
             )),
             Change::Text("A".into()),
         ])
@@ -1181,7 +1186,7 @@ mod test {
             result,
             vec![
                 Action::CSI(CSI::Sgr(Sgr::Foreground(
-                    ColorSpec::TrueColor(RgbColor::new(255, 128, 64)).into(),
+                    ColorSpec::TrueColor(RgbColor::new_8bpc(255, 128, 64)).into(),
                 ))),
                 Action::Print('A'),
             ]
@@ -1193,7 +1198,7 @@ mod test {
         let mut out = FakeTerm::new(no_terminfo_all_enabled());
         out.render(&[
             Change::Attribute(AttributeChange::Foreground(
-                ColorSpec::TrueColor(RgbColor::new(255, 128, 64)).into(),
+                ColorSpec::TrueColor(RgbColor::new_8bpc(255, 128, 64)).into(),
             )),
             Change::Text("A".into()),
         ])
@@ -1204,7 +1209,7 @@ mod test {
             result,
             vec![
                 Action::CSI(CSI::Sgr(Sgr::Foreground(
-                    ColorSpec::TrueColor(RgbColor::new(255, 128, 64)).into(),
+                    ColorSpec::TrueColor(RgbColor::new_8bpc(255, 128, 64)).into(),
                 ))),
                 Action::Print('A'),
             ]

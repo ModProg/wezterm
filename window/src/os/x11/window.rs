@@ -5,8 +5,7 @@ use crate::os::xkeysyms;
 use crate::os::{Connection, Window};
 use crate::{
     Clipboard, Dimensions, MouseButtons, MouseCursor, MouseEvent, MouseEventKind, MousePress,
-    Point, ScreenPoint, WindowDecorations, WindowEvent, WindowEventReceiver, WindowEventSender,
-    WindowOps,
+    Point, ScreenPoint, WindowDecorations, WindowEvent, WindowEventSender, WindowOps,
 };
 use anyhow::{anyhow, Context as _};
 use async_trait::async_trait;
@@ -18,6 +17,7 @@ use std::any::Any;
 use std::convert::TryInto;
 use std::rc::{Rc, Weak};
 use std::sync::{Arc, Mutex};
+use wezterm_font::FontConfiguration;
 
 #[derive(Default)]
 struct CopyAndPaste {
@@ -61,7 +61,6 @@ pub(crate) struct XWindowInner {
     cursors: CursorInfo,
     copy_and_paste: CopyAndPaste,
     config: ConfigHandle,
-    resize_promises: Vec<Promise<Dimensions>>,
 }
 
 impl Drop for XWindowInner {
@@ -122,11 +121,11 @@ impl XWindowInner {
     /// it to encompass both.  This avoids bloating the list with a series
     /// of increasing rectangles when resizing larger or smaller.
     fn expose(&mut self, _x: u16, _y: u16, _width: u16, _height: u16) {
-        self.events.try_send(WindowEvent::NeedRepaint).ok();
+        self.events.dispatch(WindowEvent::NeedRepaint);
     }
 
     fn do_mouse_event(&mut self, event: MouseEvent) -> anyhow::Result<()> {
-        self.events.try_send(WindowEvent::MouseEvent(event)).ok();
+        self.events.dispatch(WindowEvent::MouseEvent(event));
         Ok(())
     }
 
@@ -145,7 +144,7 @@ impl XWindowInner {
                 self.dpi
             );
             self.dpi = dpi;
-            let _ = self.events.try_send(WindowEvent::Resized {
+            self.events.dispatch(WindowEvent::Resized {
                 dimensions: Dimensions {
                     pixel_width: self.width as usize,
                     pixel_height: self.height as usize,
@@ -166,31 +165,37 @@ impl XWindowInner {
             }
             xcb::CONFIGURE_NOTIFY => {
                 let cfg: &xcb::ConfigureNotifyEvent = unsafe { xcb::cast_event(event) };
-                self.width = cfg.width();
-                self.height = cfg.height();
-                self.dpi = conn.default_dpi();
+                let width = cfg.width();
+                let height = cfg.height();
+                let dpi = conn.default_dpi();
+
+                if width == self.width && height == self.height && dpi == self.dpi {
+                    // Effectively unchanged; perhaps it was simply moved?
+                    // Do nothing!
+                    return Ok(());
+                }
+
+                self.width = width;
+                self.height = height;
+                self.dpi = dpi;
+
                 let dimensions = Dimensions {
                     pixel_width: self.width as usize,
                     pixel_height: self.height as usize,
                     dpi: self.dpi as usize,
                 };
-                if !self.resize_promises.is_empty() {
-                    self.resize_promises.remove(0).ok(dimensions);
-                }
 
-                self.events
-                    .try_send(WindowEvent::Resized {
-                        dimensions,
-                        is_full_screen: self.is_fullscreen().unwrap_or(false),
-                    })
-                    .ok();
+                self.events.dispatch(WindowEvent::Resized {
+                    dimensions,
+                    is_full_screen: self.is_fullscreen().unwrap_or(false),
+                });
             }
             xcb::KEY_PRESS | xcb::KEY_RELEASE => {
                 let key_press: &xcb::KeyPressEvent = unsafe { xcb::cast_event(event) };
                 self.copy_and_paste.time = key_press.time();
                 if let Some(key) = conn.keyboard.process_key_event(key_press) {
                     let key = key.normalize_shift();
-                    self.events.try_send(WindowEvent::KeyEvent(key)).ok();
+                    self.events.dispatch(WindowEvent::KeyEvent(key));
                 }
             }
 
@@ -271,13 +276,11 @@ impl XWindowInner {
                 let msg: &xcb::ClientMessageEvent = unsafe { xcb::cast_event(event) };
 
                 if msg.data().data32()[0] == conn.atom_delete() {
-                    if self.events.try_send(WindowEvent::CloseRequested).is_err() {
-                        xcb::destroy_window(conn.conn(), self.window_id);
-                    }
+                    self.events.dispatch(WindowEvent::CloseRequested);
                 }
             }
             xcb::DESTROY_NOTIFY => {
-                self.events.try_send(WindowEvent::Destroyed).ok();
+                self.events.dispatch(WindowEvent::Destroyed);
                 conn.windows.borrow_mut().remove(&self.window_id);
             }
             xcb::SELECTION_CLEAR => {
@@ -320,11 +323,11 @@ impl XWindowInner {
             }
             xcb::FOCUS_IN => {
                 log::trace!("Calling focus_change(true)");
-                self.events.try_send(WindowEvent::FocusChanged(true)).ok();
+                self.events.dispatch(WindowEvent::FocusChanged(true));
             }
             xcb::FOCUS_OUT => {
                 log::trace!("Calling focus_change(false)");
-                self.events.try_send(WindowEvent::FocusChanged(false)).ok();
+                self.events.dispatch(WindowEvent::FocusChanged(false));
             }
             _ => {
                 eprintln!("unhandled: {:x}", r);
@@ -644,13 +647,18 @@ impl XWindow {
 
     /// Create a new window on the specified screen with the specified
     /// dimensions
-    pub async fn new_window(
+    pub async fn new_window<F>(
         class_name: &str,
         name: &str,
         width: usize,
         height: usize,
         config: Option<&ConfigHandle>,
-    ) -> anyhow::Result<(Window, WindowEventReceiver)> {
+        _font_config: Rc<FontConfiguration>,
+        event_handler: F,
+    ) -> anyhow::Result<Window>
+    where
+        F: 'static + FnMut(WindowEvent, &Window),
+    {
         let config = match config {
             Some(c) => c.clone(),
             None => config::configuration(),
@@ -663,7 +671,7 @@ impl XWindow {
             })?
             .x11();
 
-        let (events, receiver) = async_channel::unbounded();
+        let mut events = WindowEventSender::new(event_handler);
 
         let window_id;
         let window = {
@@ -725,6 +733,8 @@ impl XWindow {
             .request_check()
             .context("xcb::create_window_checked")?;
 
+            events.assign_window(Window::X11(XWindow::from_id(window_id)));
+
             Arc::new(Mutex::new(XWindowInner {
                 window_id,
                 conn: Rc::downgrade(&conn),
@@ -735,7 +745,6 @@ impl XWindow {
                 copy_and_paste: CopyAndPaste::default(),
                 cursors: CursorInfo::new(&conn),
                 config: config.clone(),
-                resize_promises: vec![],
             }))
         };
 
@@ -766,7 +775,7 @@ impl XWindow {
         window_handle.set_title(name);
         window_handle.show();
 
-        Ok((window_handle, receiver))
+        Ok(window_handle)
     }
 }
 
@@ -779,7 +788,7 @@ impl XWindowInner {
         xcb::map_window(self.conn().conn(), self.window_id);
     }
     fn invalidate(&mut self) {
-        self.events.try_send(WindowEvent::NeedRepaint).ok();
+        self.events.dispatch(WindowEvent::NeedRepaint);
     }
 
     fn toggle_fullscreen(&mut self) {
@@ -894,97 +903,74 @@ impl WindowOps for XWindow {
     where
         Self: Sized,
     {
-        // If we're already on the correct thread, just queue it up
-        if let Some(conn) = Connection::get() {
-            let handle = match conn.x11().window_by_id(self.0) {
-                Some(h) => h,
-                None => return,
-            };
-            let inner = handle.lock().unwrap();
+        XConnection::with_window_inner(self.0, move |inner| {
             inner
                 .events
-                .try_send(WindowEvent::Notification(Box::new(t)))
-                .ok();
-        } else {
-            // Otherwise, get into that thread and write to the queue
-            XConnection::with_window_inner(self.0, move |inner| {
-                inner
-                    .events
-                    .try_send(WindowEvent::Notification(Box::new(t)))
-                    .ok();
-                Ok(())
-            });
-        }
+                .dispatch(WindowEvent::Notification(Box::new(t)));
+            Ok(())
+        });
     }
 
-    fn close(&self) -> Future<()> {
+    fn close(&self) {
         XConnection::with_window_inner(self.0, |inner| {
             inner.close();
             Ok(())
-        })
+        });
     }
 
-    fn hide(&self) -> Future<()> {
+    fn hide(&self) {
         XConnection::with_window_inner(self.0, |inner| {
             inner.hide();
             Ok(())
-        })
+        });
     }
 
-    fn toggle_fullscreen(&self) -> Future<()> {
+    fn toggle_fullscreen(&self) {
         XConnection::with_window_inner(self.0, |inner| {
             inner.toggle_fullscreen();
             Ok(())
-        })
+        });
     }
 
-    fn config_did_change(&self, config: &ConfigHandle) -> Future<()> {
+    fn config_did_change(&self, config: &ConfigHandle) {
         let config = config.clone();
         XConnection::with_window_inner(self.0, move |inner| {
             inner.config_did_change(&config);
             Ok(())
-        })
+        });
     }
 
-    fn show(&self) -> Future<()> {
+    fn show(&self) {
         XConnection::with_window_inner(self.0, |inner| {
             inner.show();
             Ok(())
-        })
+        });
     }
 
-    fn set_cursor(&self, cursor: Option<MouseCursor>) -> Future<()> {
+    fn set_cursor(&self, cursor: Option<MouseCursor>) {
         XConnection::with_window_inner(self.0, move |inner| {
             let _ = inner.set_cursor(cursor);
             Ok(())
-        })
+        });
     }
 
-    fn invalidate(&self) -> Future<()> {
+    fn invalidate(&self) {
         XConnection::with_window_inner(self.0, |inner| {
             inner.invalidate();
             Ok(())
-        })
+        });
     }
 
-    fn set_title(&self, title: &str) -> Future<()> {
+    fn set_title(&self, title: &str) {
         let title = title.to_owned();
         XConnection::with_window_inner(self.0, move |inner| {
             inner.set_title(&title);
             Ok(())
-        })
+        });
     }
 
-    fn set_inner_size(&self, width: usize, height: usize) -> Future<Dimensions> {
-        let mut promise = Promise::new();
-        let future = promise.get_future().unwrap();
-
-        let mut promise = Some(promise);
-
+    fn set_inner_size(&self, width: usize, height: usize) {
         XConnection::with_window_inner(self.0, move |inner| {
-            if let Some(promise) = promise.take() {
-                inner.resize_promises.push(promise);
-            }
             xcb::configure_window(
                 inner.conn().conn(),
                 inner.window_id,
@@ -995,22 +981,20 @@ impl WindowOps for XWindow {
             );
             Ok(())
         });
-
-        future
     }
 
-    fn set_window_position(&self, coords: ScreenPoint) -> Future<()> {
+    fn set_window_position(&self, coords: ScreenPoint) {
         XConnection::with_window_inner(self.0, move |inner| {
             inner.set_window_position(coords);
             Ok(())
-        })
+        });
     }
 
-    fn set_icon(&self, image: Image) -> Future<()> {
+    fn set_icon(&self, image: Image) {
         XConnection::with_window_inner(self.0, move |inner| {
             inner.set_icon(&image);
             Ok(())
-        })
+        });
     }
 
     /// Initiate textual transfer from the clipboard
@@ -1052,7 +1036,7 @@ impl WindowOps for XWindow {
     }
 
     /// Set some text in the clipboard
-    fn set_clipboard(&self, clipboard: Clipboard, text: String) -> Future<()> {
+    fn set_clipboard(&self, clipboard: Clipboard, text: String) {
         XConnection::with_window_inner(self.0, move |inner| {
             inner
                 .copy_and_paste
@@ -1060,6 +1044,6 @@ impl WindowOps for XWindow {
                 .replace(text.clone());
             inner.update_selection_owner(clipboard);
             Ok(())
-        })
+        });
     }
 }

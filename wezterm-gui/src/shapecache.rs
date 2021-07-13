@@ -16,7 +16,6 @@ pub struct ShapeCacheKey {
 #[derive(Debug, PartialEq)]
 pub struct GlyphPosition {
     pub glyph_idx: u32,
-    pub cluster: u32,
     pub num_cells: u8,
     pub x_offset: PixelLength,
     pub bearing_x: f32,
@@ -66,7 +65,6 @@ where
                             .texture
                             .as_ref()
                             .map_or(0, |t| t.coords.width() as u32),
-                        cluster: info.cluster,
                         num_cells: info.num_cells,
                         x_offset: info.x_offset,
                         bearing_x: glyph.bearing_x.get() as f32,
@@ -141,12 +139,6 @@ where
                 } else {
                     info.num_cells
                 };
-                let cluster = if num_cells > info.num_cells {
-                    info.cluster
-                        .saturating_sub((num_cells - info.num_cells) as u32)
-                } else {
-                    info.cluster
-                };
                 let bearing_x = if num_cells > info.num_cells && glyph.bearing_x.get() < 0. {
                     ((num_cells - info.num_cells) as f64 * render_metrics.cell_size.width as f64)
                         + glyph.bearing_x.get()
@@ -157,7 +149,6 @@ where
                     glyph: Rc::clone(&glyph),
                     pos: GlyphPosition {
                         glyph_idx: info.glyph_pos,
-                        cluster,
                         num_cells,
                         x_offset: info.x_offset,
                         bearing_x: bearing_x as f32,
@@ -172,7 +163,6 @@ where
                             .texture
                             .as_ref()
                             .map_or(0, |t| t.coords.width() as u32),
-                        cluster: info.cluster,
                         num_cells: info.num_cells,
                         x_offset: info.x_offset,
                         bearing_x: glyph.bearing_x.get() as f32,
@@ -331,9 +321,15 @@ mod test {
         };
         config.font_rules.clear();
         config.compute_extra_defaults(None);
-        config::use_this_configuration(config);
+        config::use_this_configuration(config.clone());
 
-        let fonts = Rc::new(FontConfiguration::new(None).unwrap());
+        let fonts = Rc::new(
+            FontConfiguration::new(
+                None,
+                config.dpi.unwrap_or_else(|| ::window::default_dpi()) as usize,
+            )
+            .unwrap(),
+        );
         let render_metrics = RenderMetrics::new(&fonts).unwrap();
         let mut glyph_cache = GlyphCache::new_in_memory(&fonts, 128, &render_metrics).unwrap();
 
@@ -345,7 +341,6 @@ mod test {
             vec![
                 GlyphPosition {
                     glyph_idx: 180,
-                    cluster: 0,
                     num_cells: 1,
                     x_offset: PixelLength::new(0.0),
                     bearing_x: 0.0,
@@ -353,7 +348,6 @@ mod test {
                 },
                 GlyphPosition {
                     glyph_idx: 637,
-                    cluster: 1,
                     num_cells: 3,
                     x_offset: PixelLength::new(0.0),
                     bearing_x: 4.0,
@@ -376,7 +370,16 @@ mod test {
             let bench_result = benchmarking::measure_function(move |measurer| {
                 let text: String = (0..n).map(|_| ' ').collect();
 
-                let fonts = Rc::new(FontConfiguration::new(None).unwrap());
+                let fonts = Rc::new(
+                    FontConfiguration::new(
+                        None,
+                        config::configuration()
+                            .dpi
+                            .unwrap_or_else(|| ::window::default_dpi())
+                            as usize,
+                    )
+                    .unwrap(),
+                );
                 let style = TextStyle::default();
                 let font = fonts.resolve_font(&style).unwrap();
                 let line = Line::from_text(&text, &CellAttributes::default());
@@ -400,11 +403,18 @@ mod test {
             .is_test(true)
             .filter_level(log::LevelFilter::Trace)
             .try_init();
-        if !config::configuration().experimental_shape_post_processing {
+        let config = config::configuration();
+        if !config.experimental_shape_post_processing {
             return;
         }
 
-        let fonts = Rc::new(FontConfiguration::new(None).unwrap());
+        let fonts = Rc::new(
+            FontConfiguration::new(
+                None,
+                config.dpi.unwrap_or_else(|| ::window::default_dpi()) as usize,
+            )
+            .unwrap(),
+        );
         let render_metrics = RenderMetrics::new(&fonts).unwrap();
         let mut glyph_cache = GlyphCache::new_in_memory(&fonts, 128, &render_metrics).unwrap();
 
@@ -416,7 +426,6 @@ mod test {
             vec![
                 GlyphPosition {
                     glyph_idx: 180,
-                    cluster: 0,
                     num_cells: 1,
                     x_offset: PixelLength::new(0.0),
                     bearing_x: 0.0,
@@ -424,7 +433,6 @@ mod test {
                 },
                 GlyphPosition {
                     glyph_idx: 205,
-                    cluster: 1,
                     num_cells: 1,
                     x_offset: PixelLength::new(0.0),
                     bearing_x: 1.0,
@@ -438,7 +446,6 @@ mod test {
             vec![
                 GlyphPosition {
                     glyph_idx: 180,
-                    cluster: 0,
                     num_cells: 1,
                     x_offset: PixelLength::new(0.0),
                     bearing_x: 0.0,
@@ -446,7 +453,6 @@ mod test {
                 },
                 GlyphPosition {
                     glyph_idx: 686,
-                    cluster: 1,
                     num_cells: 1,
                     x_offset: PixelLength::new(0.0),
                     bearing_x: 0.0,
@@ -454,7 +460,6 @@ mod test {
                 },
                 GlyphPosition {
                     glyph_idx: 205,
-                    cluster: 2,
                     num_cells: 1,
                     x_offset: PixelLength::new(0.0),
                     bearing_x: 1.0,
@@ -468,7 +473,6 @@ mod test {
             vec![
                 GlyphPosition {
                     glyph_idx: 180,
-                    cluster: 0,
                     num_cells: 1,
                     x_offset: PixelLength::new(0.0),
                     bearing_x: 0.0,
@@ -476,7 +480,6 @@ mod test {
                 },
                 GlyphPosition {
                     glyph_idx: 637,
-                    cluster: 1,
                     num_cells: 3,
                     x_offset: PixelLength::new(0.0),
                     bearing_x: 4.0,
@@ -490,7 +493,6 @@ mod test {
             vec![
                 GlyphPosition {
                     glyph_idx: 216,
-                    cluster: 0,
                     num_cells: 1,
                     x_offset: PixelLength::new(0.0),
                     bearing_x: 1.0,
@@ -498,7 +500,6 @@ mod test {
                 },
                 GlyphPosition {
                     glyph_idx: 610,
-                    cluster: 1,
                     num_cells: 1,
                     x_offset: PixelLength::new(0.0),
                     bearing_x: 0.0,
@@ -506,7 +507,6 @@ mod test {
                 },
                 GlyphPosition {
                     glyph_idx: 279,
-                    cluster: 2,
                     num_cells: 1,
                     x_offset: PixelLength::new(0.0),
                     bearing_x: 1.0,
@@ -514,7 +514,6 @@ mod test {
                 },
                 GlyphPosition {
                     glyph_idx: 308,
-                    cluster: 3,
                     num_cells: 1,
                     x_offset: PixelLength::new(0.0),
                     bearing_x: 1.0,
@@ -522,7 +521,6 @@ mod test {
                 },
                 GlyphPosition {
                     glyph_idx: 610,
-                    cluster: 4,
                     num_cells: 1,
                     x_offset: PixelLength::new(0.0),
                     bearing_x: 0.0,
@@ -536,7 +534,6 @@ mod test {
             vec![
                 GlyphPosition {
                     glyph_idx: 180,
-                    cluster: 0,
                     num_cells: 1,
                     x_offset: PixelLength::new(0.0),
                     bearing_x: 0.0,
@@ -544,7 +541,6 @@ mod test {
                 },
                 GlyphPosition {
                     glyph_idx: 686,
-                    cluster: 1,
                     num_cells: 1,
                     x_offset: PixelLength::new(0.0),
                     bearing_x: 0.0,
@@ -552,7 +548,6 @@ mod test {
                 },
                 GlyphPosition {
                     glyph_idx: 686,
-                    cluster: 2,
                     num_cells: 1,
                     x_offset: PixelLength::new(0.0),
                     bearing_x: 0.0,
@@ -560,7 +555,6 @@ mod test {
                 },
                 GlyphPosition {
                     glyph_idx: 205,
-                    cluster: 3,
                     num_cells: 1,
                     x_offset: PixelLength::new(0.0),
                     bearing_x: 1.0,
@@ -573,7 +567,6 @@ mod test {
             cluster_and_shape(&render_metrics, &mut glyph_cache, &style, &font, "<-"),
             vec![GlyphPosition {
                 glyph_idx: 1065,
-                cluster: 0,
                 num_cells: 2,
                 x_offset: PixelLength::new(0.0),
                 bearing_x: 1.0,
@@ -585,7 +578,6 @@ mod test {
             cluster_and_shape(&render_metrics, &mut glyph_cache, &style, &font, "<>"),
             vec![GlyphPosition {
                 glyph_idx: 1089,
-                cluster: 0,
                 num_cells: 2,
                 x_offset: PixelLength::new(0.0),
                 bearing_x: 2.0,
@@ -597,7 +589,6 @@ mod test {
             cluster_and_shape(&render_metrics, &mut glyph_cache, &style, &font, "|=>"),
             vec![GlyphPosition {
                 glyph_idx: 1040,
-                cluster: 0,
                 num_cells: 3,
                 x_offset: PixelLength::new(0.0),
                 bearing_x: 2.0,
@@ -616,7 +607,6 @@ mod test {
             ),
             vec![GlyphPosition {
                 glyph_idx: 790,
-                cluster: 0,
                 num_cells: 1,
                 x_offset: PixelLength::new(0.0),
                 bearing_x: 0.0,
@@ -635,7 +625,6 @@ mod test {
             ),
             vec![GlyphPosition {
                 glyph_idx: 32,
-                cluster: 0,
                 num_cells: 2,
                 x_offset: PixelLength::new(0.0),
                 bearing_x: 7.0,
@@ -647,7 +636,6 @@ mod test {
             cluster_and_shape(&render_metrics, &mut glyph_cache, &style, &font, "<!--"),
             vec![GlyphPosition {
                 glyph_idx: 1071,
-                cluster: 0,
                 num_cells: 4,
                 x_offset: PixelLength::new(0.0),
                 bearing_x: 1.0,
@@ -670,7 +658,6 @@ mod test {
             ),
             vec![GlyphPosition {
                 glyph_idx: 298,
-                cluster: 0,
                 num_cells: 2,
                 x_offset: PixelLength::new(0.0),
                 bearing_x: 1.0666667,
@@ -690,7 +677,6 @@ mod test {
             ),
             vec![GlyphPosition {
                 glyph_idx: 1583,
-                cluster: 0,
                 num_cells: 2,
                 x_offset: PixelLength::new(0.0),
                 bearing_x: 0.,
