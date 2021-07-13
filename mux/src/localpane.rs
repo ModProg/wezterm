@@ -15,6 +15,7 @@ use smol::channel::{bounded, Receiver, TryRecvError};
 use std::cell::{RefCell, RefMut};
 use std::collections::{HashMap, HashSet};
 use std::io::Result as IoResult;
+use std::ops::Deref;
 use std::ops::Range;
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, RawHandle};
@@ -23,7 +24,10 @@ use termwiz::escape::DeviceControlMode;
 use termwiz::surface::Line;
 use url::Url;
 use wezterm_term::color::ColorPalette;
-use wezterm_term::{Alert, AlertHandler, CSI, CellAttributes, Clipboard, KeyCode, KeyModifiers, MouseEvent, SemanticZone, StableRowIndex, Terminal};
+use wezterm_term::{
+    Alert, AlertHandler, CellAttributes, Clipboard, KeyCode, KeyModifiers, MouseEvent,
+    SemanticZone, StableRowIndex, Terminal, TerminalState, CSI,
+};
 
 #[derive(Debug)]
 enum ProcessState {
@@ -272,7 +276,9 @@ impl Pane for LocalPane {
     fn focus_changed(&self, focused: bool) {
         self.terminal.borrow_mut().focus_changed(focused);
         // FIXME This should only be called when focus changed events are wanted
-        write!(self.writer(), "{}{}", CSI, if focused { "I" } else { "O" }).ok();
+        if self.terminal.borrow().deref().deref().focus_tracking {
+            write!(self.writer(), "{}{}", CSI, if focused { "I" } else { "O" }).ok();
+        }
     }
 
     fn is_mouse_grabbed(&self) -> bool {

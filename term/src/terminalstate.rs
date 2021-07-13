@@ -276,7 +276,7 @@ pub struct TerminalState {
 
     /// Movement events enabled
     any_event_mouse: bool,
-    focus_tracking: bool,
+    pub focus_tracking: bool,
     /// SGR style mouse tracking and reporting is enabled
     sgr_mouse: bool,
     mouse_tracking: bool,
