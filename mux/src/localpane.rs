@@ -23,10 +23,7 @@ use termwiz::escape::DeviceControlMode;
 use termwiz::surface::Line;
 use url::Url;
 use wezterm_term::color::ColorPalette;
-use wezterm_term::{
-    Alert, AlertHandler, CellAttributes, Clipboard, KeyCode, KeyModifiers, MouseEvent,
-    SemanticZone, StableRowIndex, Terminal,
-};
+use wezterm_term::{Alert, AlertHandler, CSI, CellAttributes, Clipboard, KeyCode, KeyModifiers, MouseEvent, SemanticZone, StableRowIndex, Terminal};
 
 #[derive(Debug)]
 enum ProcessState {
@@ -274,6 +271,8 @@ impl Pane for LocalPane {
 
     fn focus_changed(&self, focused: bool) {
         self.terminal.borrow_mut().focus_changed(focused);
+        // FIXME This should only be called when focus changed events are wanted
+        write!(self.writer(), "{}{}", CSI, if focused { "I" } else { "O" }).ok();
     }
 
     fn is_mouse_grabbed(&self) -> bool {

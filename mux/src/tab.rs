@@ -1262,7 +1262,15 @@ impl Tab {
     }
 
     pub fn set_active_idx(&self, pane_index: usize) {
+        // TODO this is probably no the only place that requires this call
+        if let Some(active) = self.get_active_pane() {
+            active.focus_changed(false)
+        }
         *self.active.borrow_mut() = pane_index;
+        // TODO this is probably no the only place that requires this call
+        if let Some(active) = self.get_active_pane() {
+            active.focus_changed(true)
+        }
     }
 
     /// Assigns the root pane.
